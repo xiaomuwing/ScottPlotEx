@@ -15,7 +15,9 @@ ScottPlotEx.sln
 ├─ src/ScottPlotEx.Demo       演示程序：每秒添加 1 个数据点、可切换模式；另有“多曲线测试”“10 曲线流式演示”“堆叠堆积压测”窗口
 ├─ tests/ScottPlotEx.Tests    自动化测试（227 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
 ├─ artifacts/                 测试生成的示例图片
-└─ docs/                      真实演示程序运行截图
+├─ docs/                      真实演示程序运行截图
+├─ LICENSE                    本项目许可（MIT）
+└─ THIRD-PARTY-NOTICES.md     第三方软件的许可与版权声明
 ```
 
 ## 快速开始
@@ -705,3 +707,10 @@ dotnet test ScottPlotEx.sln --filter "FullyQualifiedName~Flicker"
 - .NET 8（`net8.0-windows10.0.19041.0`）
 - [ScottPlot.WinForms 5.1.59](https://www.nuget.org/packages/ScottPlot.WinForms)（含 ScottPlot 5、SkiaSharp）
 - 测试项目：xunit 2.9.3 + Microsoft.NET.Test.Sdk
+
+## 许可
+
+本项目以 [MIT 许可](LICENSE)发布。
+
+依赖的 ScottPlot、SkiaSharp 等同样是 MIT 等宽松许可；`DpiAwareMouseDragPan.cs` 改写自 ScottPlot 源码。
+各第三方组件的许可与版权声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)，分发编译后的程序时请一并附上。

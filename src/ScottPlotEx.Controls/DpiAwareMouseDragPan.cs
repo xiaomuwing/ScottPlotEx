@@ -1,3 +1,7 @@
+// 本文件按 ScottPlot 的 MouseDragPan 与 MouseAxisManipulation.DragPan 改写（https://github.com/ScottPlot/ScottPlot）。
+// ScottPlot: Copyright (c) 2018 Scott Harden / Harden Technologies, LLC
+// 以 MIT 许可发布，许可全文见仓库根目录的 THIRD-PARTY-NOTICES.md。
+
 using ScottPlot;
 using ScottPlot.Interactivity;
 using ScottPlot.Interactivity.UserActionResponses;
