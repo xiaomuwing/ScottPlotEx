@@ -1,0 +1,22 @@
+## 生成目录
+bin/
+obj/
+artifacts/bin/
+artifacts/obj/
+
+## Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## 测试结果
+TestResults/
+*.trx
+*.coverage
+
+## 其它
+*.log
+*.tmp

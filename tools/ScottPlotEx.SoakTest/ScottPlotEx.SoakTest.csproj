@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ScottPlotEx.SoakTest</RootNamespace>
+    <AssemblyName>ScottPlotEx.SoakTest</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <Description>长时间（默认 8 小时）时间压力测试：持续驱动 ScrollingPlotControl，记录稳定性、内存与句柄趋势。</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ScottPlotEx.Controls\ScottPlotEx.Controls.csproj" />
+  </ItemGroup>
+
+  <!-- NU1701：ScottPlot.WinForms 会传递引入仅支持 .NET Framework 的 OpenTK 3.1.0（本工具不使用）。 -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
+  </PropertyGroup>
+
+</Project>
