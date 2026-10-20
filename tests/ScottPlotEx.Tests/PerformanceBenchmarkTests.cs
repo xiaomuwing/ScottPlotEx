@@ -37,9 +37,16 @@ public class PerformanceBenchmarkTests
         ScrollingPlotControl plot = host.ControlAs<ScrollingPlotControl>();
         StringBuilder report = new();
 
+#if DEBUG
+        const string BuildConfiguration = "Debug（控件代码未经过 JIT 优化，性能数字会明显偏低，请用 Release 复测）";
+#else
+        const string BuildConfiguration = "Release（已优化）";
+#endif
+
         report.AppendLine("# ScottPlotEx 控件性能基准：最大每秒数据更新数量");
         report.AppendLine();
         report.AppendLine($"- 生成时间：{DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        report.AppendLine($"- 构建配置：{BuildConfiguration}");
         report.AppendLine($"- 操作系统：{RuntimeInformation.OSDescription}");
         report.AppendLine($"- 处理器：{Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER")}（逻辑核心数 {Environment.ProcessorCount}）");
         report.AppendLine($"- 运行时：{RuntimeInformation.FrameworkDescription}");

@@ -22,6 +22,10 @@ public sealed class PlotSeries
     private float _lineWidth = 1f;
     private bool _isVisible = true;
 
+    /// <summary>用户通过 <see cref="Signal"/> 直接修改的线型 / 标记样式（Reset 重建图元时原样恢复）。</summary>
+    private ScottPlot.LineStyle? _lineStyle;
+    private ScottPlot.MarkerStyle? _markerStyle;
+
     /// <summary>本曲线自己的采样间隔（秒），0 表示使用控件的 <see cref="ScrollingPlotControl.DefaultSampleInterval"/>。</summary>
     private double _intervalSeconds;
 
@@ -297,6 +301,11 @@ public sealed class PlotSeries
         _color = Plottable.Color;
         _lineWidth = Plottable.LineWidth;
         _isVisible = Plottable.IsVisible;
+
+        // 线型（实线 / 虚线 / 点线……）与标记样式保存在独立的样式对象里，
+        // 只记录颜色 / 线宽会丢失它们；直接保存引用，重建图元时原样挂接。
+        _lineStyle = Plottable.LineStyle;
+        _markerStyle = Plottable.MarkerStyle;
     }
 
     /// <summary>把样式应用到当前图元。</summary>
@@ -304,6 +313,12 @@ public sealed class PlotSeries
     {
         if (Plottable is null)
             return;
+
+        if (_lineStyle is not null)
+            Plottable.LineStyle = _lineStyle;
+
+        if (_markerStyle is not null)
+            Plottable.MarkerStyle = _markerStyle;
 
         Plottable.LegendText = _name;
         Plottable.Color = _color;

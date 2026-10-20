@@ -13,7 +13,7 @@
 ScottPlotEx.sln
 ├─ src/ScottPlotEx.Controls   用户控件库（核心交付物）
 ├─ src/ScottPlotEx.Demo       演示程序：每秒添加 1 个数据点、可切换模式；另有“多曲线测试”“10 曲线流式演示”“堆叠堆积压测”窗口
-├─ tests/ScottPlotEx.Tests    自动化测试（227 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
+├─ tests/ScottPlotEx.Tests    自动化测试（236 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
 ├─ artifacts/                 测试生成的示例图片
 ├─ docs/                      真实演示程序运行截图
 ├─ LICENSE                    本项目许可（MIT）
@@ -24,8 +24,8 @@ ScottPlotEx.sln
 
 ```powershell
 dotnet build ScottPlotEx.sln          # 生成解决方案
-dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（227 个）
-dotnet test  ScottPlotEx.sln --filter "Category=Performance"   # 只跑性能基准
+dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（236 个）
+dotnet test  ScottPlotEx.sln -c Release --filter "Category=Performance"   # 只跑性能基准（必须 Release）
 dotnet run --project src\ScottPlotEx.Demo   # 运行演示程序
 dotnet run --project src\ScottPlotEx.Demo -- --multiseries   # 直接打开“多曲线测试”窗口（--preset 0/1/2 选择预设场景，--unit 0/1/2 选择 X 轴单位；--unit 2 绝对时间会自动把起始时间设为当前时间）
 ```
@@ -130,7 +130,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | 补充 5 | 两种模式都要能设置 X 轴显示长度（百分比接口） | `SetXAxisDisplayPercent(percent, mode)`（写入必须指定模式）+ 只读的 `CurrentXAxisDisplayPercent`/`GetXAxisDisplayPercent(mode)` + `ShowAllData()`；底层为 `StackedDisplayPercent`（默认 100 = 全部数据）与 `FollowWindowPercent`（默认 30，尾部窗口）。**方向一致：数值越大看得越多**，越界自动限制，改动后立即重算坐标轴且不切换模式 | `XAxisDisplayPercentTests`、`ReproFollowToStackedTests.StackedMode_DisplayPercent90_StillLooksStacked`、`ScrollingAxisCalculatorTests.StackedMode_DisplayPercent*` / `FollowMode_WindowPercent*` |
 | 补充 6 | 调整百分比后必须能改回堆叠模式 | **重新选择模式即恢复该模式默认视图**：选择“堆叠模式”把原点百分比复位为 0%（`X: [0, 点数+2]`），选择“跟随模式”把窗口复位为 30%；数据更新、拖动、中键整体显示都不会复位。可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 改为“百分比跨模式保持” | `ReproFollowToStackedTests.AfterChangingStackedPercent_ReselectingStackedShowsAllData` / `AfterChangingFollowPercent_ReselectingFollowRestoresDefaultWindow` / `DisplayPercent_CanPersistAcrossModeChanges`、`docs/demo-08-stacked-after-percent.png` |
 | 补充 7 | X 轴单位对标 imc：点数 / 相对时间 / 绝对时间；每条曲线可以有自己的采样间隔；跟随窗口同样支持三种单位；时间单位下平滑滚动；绝对时间必须设置起始时间 | `XAxisUnit`、`PlotSeries.SampleInterval / SampleRate / StartTime`、`DefaultSampleInterval / DefaultStartTime`、`FollowWindowDuration`；所有按 X 计算的地方按曲线做“下标 ↔ X”换算（`SeriesXExtent`、`PlotDataBuffer.XStart / XStep`、数据源 `Period / XOffset`）；`TimeAxisTickGenerator` 生成时间刻度 | `XAxisUnitTests`、`XAxisUnitDemoTests`、`artifacts/x-axis-*.png` |
-| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 227 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
+| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 236 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
 
 ## 控件 API
 
@@ -399,7 +399,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 
 ```powershell
 dotnet test ScottPlotEx.sln
-# 已通过! - 失败: 0，通过: 227，已跳过: 0，总计: 227（不含 Category=Performance）
+# 已通过! - 失败: 0，通过: 236，已跳过: 0，总计: 236（不含 Category=Performance）
 ```
 
 测试分两类：
@@ -448,7 +448,7 @@ dotnet test ScottPlotEx.sln
 ## 性能基准：最大每秒数据更新数量
 
 ```powershell
-dotnet test ScottPlotEx.sln --filter "Category=Performance"
+dotnet test ScottPlotEx.sln -c Release --filter "Category=Performance"
 # 结果同时写入 artifacts/performance-report.md
 ```
 
@@ -462,6 +462,23 @@ dotnet test ScottPlotEx.sln --filter "Category=Performance"
 | 仅数据接入（跟随模式，1 万 ～ 100 万点缓冲） | **≈ 96 万 ～ 85 万点/秒**（优化前 1 万 / 10 万点缓冲为 7.4 万 / 1.4 万点/秒，可见范围统计为 O(窗口)） |
 | 数据 + 真实绘制交错（1,000 / 10,000 / 100,000 点缓冲） | **≈ 250 / 300 / 271 点/秒**（优化前 210 / 96 / 53） |
 | 每个数据点后立即绘制一帧（1,000 / 10,000 / 100,000 点） | **≈ 182 / 199 / 122 点/秒**（优化前 172 / 62 / 41，最保守用法） |
+
+2026-10-20 审查（缓存默认坐标轴引用 + 同一帧只请求一次重绘，消除逐点写入的隐藏分配）后，同机 Release 复测：
+
+| 使用方式 | 最大更新率 |
+|---|---|
+| 仅数据接入（堆叠模式，合并渲染 —— 控件默认行为） | **≈ 343 万 ～ 352 万点/秒**（0.28 ～ 0.29 µs/点，**0 B/点托管分配**） |
+| 仅数据接入（堆叠模式显示 90% / 拖动后继续滚动，100 万点缓冲） | **≈ 123 万 ～ 133 万点/秒** |
+| 仅数据接入（跟随模式，1 万 ～ 100 万点缓冲） | **≥ 125 万点/秒**（不同运行 125 万 ～ 667 万，受 JIT / CPU 调度影响） |
+| 数据 + 真实绘制交错（1,000 / 10,000 / 100,000 点缓冲） | **≈ 800 / 745 / 690 点/秒** |
+| 每个数据点后立即绘制一帧（1,000 / 10,000 / 100,000 点） | **≈ 560 ～ 610 / 700 ～ 760 / 330 ～ 370 点/秒**（最保守用法） |
+
+> 旧实现每个数据点分配约 **192 字节**：`AxisManager.Bottom` / `Left` 的 LINQ 查找 80 B、`SetLimits` 80 B、`Invalidate` 32 B。
+> 高频逐点写入时这就是 GC 压力的主要来源；现在坐标轴引用缓存在控件里（用户替换坐标轴时自动重新解析），
+> 同一帧的重复 `Invalidate` 也被合并，因此稳定状态下逐点写入为 0 B/点，堆叠模式接入从约 1.0 µs/点降到 0.29 µs/点。
+>
+> **注意：接入吞吐 ≠ 屏幕刷新帧率。** 上表衡量的是 UI 线程能多快接住数据；平均 FPS 由下一节的单帧绘制耗时决定。
+> 0 B/点优化减少的是 GC 抖动与高写入率下的卡顿，不会改变 SkiaSharp 路径构建 / 抗锯齿光栅化的耗时。
 
 单帧绘制耗时：空图基线 2.6 ms、1,000 点 3.8 ms、10,000 点 3.4 ms、100,000 点 4.8 ms、1,000,000 点 5.2 ms
 （优化前 2.1 / 4.2 / 8.7 / 13.4 / 18.2 ms）。
@@ -484,11 +501,22 @@ dotnet test ScottPlotEx.sln --filter "Category=Performance"
 
 结论与建议：
 
-- 数据接入很快，且各模式都与缓冲区大小基本无关（≥85 万点/秒），**不丢点、不阻塞 UI**（控件默认合并渲染，多个数据点共用一帧）；
+- 数据接入很快，且各模式都与缓冲区大小基本无关（新测量最低约 120 万点/秒，堆叠模式约 345 万点/秒），**不丢点、不阻塞 UI**（控件默认合并渲染，多个数据点共用一帧）；
 - 单帧绘制耗时基本不再随屏上点数增长：曲线数据源用极值金字塔逐像素列求极值，线宽 1 走 SkiaSharp 快速光栅化；
   100 万点仍有约 190 FPS 的余量；
 - 每秒 1 点（演示程序场景）或每秒几十~几百点的采集场景：余量在百倍以上；
 - 长时间高速采集时缓冲区仍会持续增长（内存随点数线性增加），需要时请定期 `ClearData()` 或自行限制保留的点数。
+
+### 2026-10-20 审查补充
+
+除上面的接入吞吐优化（0 B/点）外，本次审查还修复了以下边界行为，并补充了回归测试（`EdgeCaseRegressionTests`、`IngestAllocationTests`）：
+
+- `Reset()` 现在会把堆叠原点重新固定为 0：之前显示百分比 < 100 时 Reset 后写新数据，X 轴仍停在旧原点，新数据会落在视图之外；
+- 隐藏 / 删除最长曲线后，堆叠百分比按剩余可见曲线重新固定原点：之前旧原点可能超过新的右端，剩余数据整段不可见；
+- `Reset(当前 Plot, disposeOldPlot: false)` 不再重复挂接曲线图元（同一条曲线不会被画两次、图例不重复）；
+- 句柄创建前的后台 `AddValue` / `AddValues` / `ClearData` / `AddSeries` 不再直接跨线程修改 List / Plot，而是排队到句柄创建后统一执行；曲线样式与 `Remove()` 等操作同样在 UI 线程排队；
+- 通过 `Signal` 直接设置的线型（虚线等）与标记样式在 `Reset()` 后保留（之前只保留名称 / 颜色 / 线宽 / 可见性）；
+- “显示帮助”改为打开使用 `PlotHelpContent` 的完整中文说明窗口（模式、X 轴单位、鼠标操作、数据接口），不再打开旧版 `FormHelp` 鼠标提示窗口。
 
 ### 10 条曲线 × 每条 1000 点/秒：自建缓冲写法 vs 控件多曲线 API
 

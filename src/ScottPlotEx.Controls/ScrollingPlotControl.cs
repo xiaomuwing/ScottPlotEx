@@ -47,6 +47,22 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private readonly ChinesePlotMenu _plotMenu;
     private readonly List<ContextMenuStrip> _contextMenus = [];
 
+    /// <summary>
+    /// 创建控件时的线程。句柄创建之前 <see cref="Control.InvokeRequired"/> 总是返回 false，
+    /// 采集线程会被误判成 UI 线程而直接写 List / Plot；这里用它判断“句柄创建前是否在 UI 线程上”，
+    /// 非 UI 线程的写入先进入待处理列表，句柄创建时再统一处理。
+    /// </summary>
+    private readonly int _uiThreadId = Environment.CurrentManagedThreadId;
+
+    /// <summary>句柄创建前从其它线程排队、创建后要在 UI 线程上执行的界面操作（样式、删除等）。</summary>
+    private readonly Queue<Action> _pendingUiActions = new();
+
+    /// <summary>句柄创建前从其它线程添加的曲线：句柄创建后再挂接到 Plot（避免后台线程操作 Plot）。</summary>
+    private readonly List<PlotSeries> _pendingAttach = [];
+
+    private readonly Action _attachPendingAction;
+    private readonly Action _runPendingUiActionsAction;
+
     /// <summary>全部曲线（含默认曲线，默认曲线始终在第一位）。只在 UI 线程上修改，修改时持有待处理锁。</summary>
     private readonly List<PlotSeries> _series = [];
     private readonly PlotSeries _defaultSeries;
@@ -98,6 +114,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>0 表示没有排队中的合并写入；否则为投递时刻（<see cref="Stopwatch.GetTimestamp"/>）。</summary>
     private long _flushPostedAt;
 
+    /// <summary>句柄创建前的合并写入投递失败了：句柄创建时要补投一次（见 <see cref="OnHandleCreated"/>）。</summary>
+    private int _flushRetryOnHandleCreated;
+
     /// <summary>合并写入已执行、正在等待这一帧画完（仅 UI 线程访问）。</summary>
     private bool _flushAwaitingRender;
 
@@ -110,63 +129,293 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private Plot? _renderHookedPlot;
 
     /// <summary>
+    /// 自动滚动使用的默认 X / Y 轴（缓存引用，避免每次读写坐标轴都调用
+    /// <see cref="ScottPlot.AxisManager.Bottom"/> / <see cref="ScottPlot.AxisManager.Left"/> 的 LINQ 查找：
+    /// 这两个属性每次调用都会分配约 40 字节，逐点写入时是主要的 GC 来源）。
+    /// 用户替换 / 删除默认坐标轴时由 <see cref="EnsureAxesCurrent"/> 自动重新解析。
+    /// </summary>
+    private IXAxis? _xAxis;
+    private IYAxis? _yAxis;
+
+    /// <summary>
+    /// 设计器兜底模式：SkiaSharp / ScottPlot 初始化失败时不创建 Plot，只显示占位说明。
+    /// 此时 <see cref="_canvas"/> / <see cref="_plotMenu"/> / <see cref="_defaultSeries"/> 为 null，
+    /// 所有公开成员都必须先判断这个标志。
+    /// </summary>
+    private bool _designerFallback;
+
+    /// <summary>设计器兜底模式下保存 <see cref="ShowModeMenuItems"/> 的值（没有菜单对象可写入）。</summary>
+    private bool _showModeItemsFallback = true;
+
+    /// <summary>当前控件是否处于设计器兜底（占位）模式。</summary>
+    internal bool IsDesignerFallback => _designerFallback;
+
+    /// <summary>
     /// 创建控件：内嵌 ScottPlot 控件、挂接中文右键菜单与鼠标观察器。
+    /// <para>
+    /// 在 Visual Studio 设计器中，SkiaSharp 原生库可能无法加载；此时会降级为占位控件，
+    /// 保证控件可以被拖放到 Form 上并正常生成设计器代码。运行时资源正常时行为不变。
+    /// </para>
     /// </summary>
     public ScrollingPlotControl()
     {
         _flushPendingAction = FlushPendingValues;
-
-        // 默认曲线：单曲线接口（AddValue / AddValues / Values / DataCount ……）读写的就是它；名称为空，不出现在图例中
-        _defaultSeries = new PlotSeries(this, string.Empty, Colors.Blue, isDefault: true);
-        _series.Add(_defaultSeries);
-        _seriesCreated = 1;
+        _attachPendingAction = AttachPendingSeries;
+        _runPendingUiActionsAction = RunPendingUiActions;
 
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
         DoubleBuffered = true;
         BackColor = SystemColors.Control;
 
-        // 自绘画布：SkiaSharp 直接渲染进 GDI DIB，WM_PAINT 中一次 BitBlt 到窗口。
-        // 画布自身已是 Opaque + AllPaintingInWmPaint（不擦背景），DIB 就是后台缓冲，
-        // 因此不再需要原先对 FormsPlot 的双缓冲 / 跳过背景擦除处理。
-        _canvas = new PlotCanvas
+        _defaultSeries = null!;
+        _canvas = null!;
+        _plotMenu = null!;
+
+        if (DesignerSupport.ForceDesignerFallback)
         {
-            Dock = DockStyle.Fill,
-            Name = "ScottPlot",
-        };
-        Controls.Add(_canvas);
+            InitializeDesignerFallback(null);
+            return;
+        }
 
-        // 中文右键菜单：菜单项与 ScottPlot 自带内容完全一致，并增加“显示帮助”
-        _plotMenu = new ChinesePlotMenu(this);
-        _canvas.Menu = _plotMenu;
-
-        // 焦点丢失：ScottPlot 默认会立刻同步重绘整帧（Refresh()），而焦点变化往往正好发生在
-        // 用户刚开始操作鼠标的那一刻（例如单击窗口把它激活），同步整帧重绘会造成一次明显卡顿。
-        // 这里保留“焦点丢失即终止拖动”的语义，只把同步重绘改成合并重绘（不阻塞消息处理）。
-        _canvas.UserInputProcessor.LostFocusAction = control =>
+        try
         {
-            ScottPlot.Interactivity.UserInputProcessor.ResetState(control);
-            RequestRender();
-        };
+            // 默认曲线：单曲线接口（AddValue / AddValues / Values / DataCount ……）读写的就是它；名称为空，不出现在图例中
+            _defaultSeries = new PlotSeries(this, string.Empty, Colors.Blue, isDefault: true);
+            _series.Add(_defaultSeries);
+            _seriesCreated = 1;
 
-        // 只观察鼠标事件：ScottPlot 自身先处理输入（画布在触发事件前已转发给 UserInputProcessor），
-        // 我们随后判断视图是否发生变化
-        _canvas.MouseDown += OnPlotMouseDown;
-        _canvas.MouseMove += OnPlotMouseMove;
-        _canvas.MouseUp += OnPlotMouseUp;
-        _canvas.MouseWheel += OnPlotMouseWheel;
+            // 自绘画布：SkiaSharp 直接渲染进 GDI DIB，WM_PAINT 中一次 BitBlt 到窗口。
+            // 画布自身已是 Opaque + AllPaintingInWmPaint（不擦背景），DIB 就是后台缓冲，
+            // 因此不再需要原先对 FormsPlot 的双缓冲 / 跳过背景擦除处理。
+            _canvas = new PlotCanvas
+            {
+                Dock = DockStyle.Fill,
+                Name = "ScottPlot",
+            };
+            Controls.Add(_canvas);
 
-        ApplyDefaultFont();
-        AttachDataToCurrentPlot();
+            // 中文右键菜单：菜单项与 ScottPlot 自带内容完全一致，并增加“显示帮助”
+            _plotMenu = new ChinesePlotMenu(this);
+            _canvas.Menu = _plotMenu;
 
-        // 构造完成时就建立“稳定空视图”（X 0~1、Y -0.5~0.5）：
-        // ScottPlot 的坐标轴在首次渲染或显式设置范围之前处于“未设置”状态，此时
-        // Plot.Axes.GetLimits() 返回 (Left=+∞, Right=-∞)（IsReal = false）。
-        // 如果只依赖 AddValue / ClearData / Reset 去建立空视图，那么新建（或释放后重建）的控件
-        // 在第一个数据点到达、或首次绘制完成之前会暴露一个非法的坐标轴范围；
-        // 这里与 AddValue / ClearData / Reset 保持一致，让控件从构造完成那一刻起就同时拥有
-        // “有效的空视图”和“可用的回滚基准”（_lastKnownLimits）。
-        ApplyAutoScroll();
-        RememberLimits();
+            // 焦点丢失：ScottPlot 默认会立刻同步重绘整帧（Refresh()），而焦点变化往往正好发生在
+            // 用户刚开始操作鼠标的那一刻（例如单击窗口把它激活），同步整帧重绘会造成一次明显卡顿。
+            // 这里保留“焦点丢失即终止拖动”的语义，只把同步重绘改成合并重绘（不阻塞消息处理）。
+            _canvas.UserInputProcessor.LostFocusAction = control =>
+            {
+                ScottPlot.Interactivity.UserInputProcessor.ResetState(control);
+                RequestRender();
+            };
+
+            // 只观察鼠标事件：ScottPlot 自身先处理输入（画布在触发事件前已转发给 UserInputProcessor），
+            // 我们随后判断视图是否发生变化
+            _canvas.MouseDown += OnPlotMouseDown;
+            _canvas.MouseMove += OnPlotMouseMove;
+            _canvas.MouseUp += OnPlotMouseUp;
+            _canvas.MouseWheel += OnPlotMouseWheel;
+
+            ApplyDefaultFont();
+            AttachDataToCurrentPlot();
+
+            // 构造完成时就建立“稳定空视图”（X 0~1、Y -0.5~0.5）：
+            // ScottPlot 的坐标轴在首次渲染或显式设置范围之前处于“未设置”状态，此时
+            // Plot.Axes.GetLimits() 返回 (Left=+∞, Right=-∞)（IsReal = false）。
+            // 如果只依赖 AddValue / ClearData / Reset 去建立空视图，那么新建（或释放后重建）的控件
+            // 在第一个数据点到达、或首次绘制完成之前会暴露一个非法的坐标轴范围；
+            // 这里与 AddValue / ClearData / Reset 保持一致，让控件从构造完成那一刻起就同时拥有
+            // “有效的空视图”和“可用的回滚基准”（_lastKnownLimits）。
+            ApplyAutoScroll();
+            RememberLimits();
+        }
+        catch (Exception exception) when (DesignerSupport.IsNativeLibraryFailure(exception) || DesignerSupport.IsDesignTime)
+        {
+            // 设计器 / 缺少 SkiaSharp 原生库：清掉半初始化状态，显示占位控件，保证拖放不会报错。
+            _series.Clear();
+            _seriesCreated = 0;
+
+            if (_canvas is not null)
+            {
+                try
+                {
+                    Controls.Remove(_canvas);
+                    _canvas.Dispose();
+                }
+                catch
+                {
+                    // 半初始化状态，清理失败也不能影响设计器
+                }
+            }
+
+            _defaultSeries = null!;
+            _canvas = null!;
+            _plotMenu = null!;
+
+            InitializeDesignerFallback(exception);
+        }
+    }
+
+    /// <summary>设计器 / 缺少原生 SkiaSharp 时使用的占位视图。</summary>
+    private void InitializeDesignerFallback(Exception? exception)
+    {
+        _designerFallback = true;
+
+        SuspendLayout();
+
+        try
+        {
+            foreach (Control child in Controls.Cast<Control>().ToArray())
+            {
+                Controls.Remove(child);
+                child.Dispose();
+            }
+
+            string detail = exception is null
+                ? "SkiaSharp / ScottPlot 运行库仅在设计器外部加载。"
+                : "SkiaSharp 原生库加载失败，设计器只显示占位视图；运行时请确保输出目录包含 runtimes/win-*/native/libSkiaSharp.dll。";
+
+            System.Windows.Forms.Label placeholder = new()
+            {
+                Dock = DockStyle.Fill,
+                Name = "ScottPlotDesignerPlaceholder",
+                Text = "ScrollingPlotControl\r\n\r\n" + detail + "\r\n\r\n控件可以正常拖放和保存，运行时会显示实时曲线。",
+                TextAlign = ContentAlignment.MiddleCenter,
+                ForeColor = SystemColors.GrayText,
+                BackColor = SystemColors.Control,
+                Padding = new Padding(12),
+            };
+
+            Controls.Add(placeholder);
+        }
+        finally
+        {
+            ResumeLayout(true);
+        }
+    }
+
+    /// <summary>
+    /// 当前调用是否在控件的 UI 线程上。句柄创建之前 <see cref="Control.InvokeRequired"/> 总是 false，
+    /// 不能用来判断线程，因此这里改用创建控件时记录的线程 ID。
+    /// </summary>
+    private bool IsOnUiThread =>
+        IsHandleCreated ? !InvokeRequired : Environment.CurrentManagedThreadId == _uiThreadId;
+
+    /// <summary>
+    /// 句柄创建后：在 UI 线程上执行句柄创建前排队的界面操作、挂接排队添加的曲线，
+    /// 并投递句柄创建前收到的数据（见 <see cref="IsOnUiThread"/>）。
+    /// </summary>
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+
+        if (IsDisposed || Disposing || _designerFallback)
+            return;
+
+        RunPendingUiActions();
+        AttachPendingSeries();
+
+        // 句柄创建前投递失败的合并写入 / 尚未处理的数据：句柄已存在，可以正常投递了。
+        // 没有待处理数据时不投递，保持“UI 线程写入不产生合并写入”的语义。
+        if (HasPendingWrites() || Interlocked.Exchange(ref _flushRetryOnHandleCreated, 0) != 0)
+            PostPendingFlush();
+    }
+
+    /// <summary>是否有等待合并写入的数据或清空请求（只在持锁时读取各曲线的待处理列表）。</summary>
+    private bool HasPendingWrites()
+    {
+        lock (_pendingLock)
+        {
+            foreach (PlotSeries series in _series)
+            {
+                if (series.PendingValues.Count > 0 || series.PendingClear)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>在 UI 线程上执行句柄创建前排队的界面操作（样式、删除等）。</summary>
+    private void RunPendingUiActions()
+    {
+        if (IsDisposed || Disposing)
+            return;
+
+        Action[] actions;
+
+        lock (_pendingLock)
+        {
+            if (_pendingUiActions.Count == 0)
+                return;
+
+            actions = [.. _pendingUiActions];
+            _pendingUiActions.Clear();
+        }
+
+        foreach (Action action in actions)
+            action();
+    }
+
+    /// <summary>在 UI 线程上挂接句柄创建前从其它线程添加的曲线。</summary>
+    private void AttachPendingSeries()
+    {
+        if (IsDisposed || Disposing || _designerFallback || _canvas is null)
+            return;
+
+        PlotSeries[] attach;
+
+        lock (_pendingLock)
+        {
+            if (_pendingAttach.Count == 0)
+                return;
+
+            attach = [.. _pendingAttach];
+            _pendingAttach.Clear();
+        }
+
+        Plot plot = _canvas.Plot;
+
+        foreach (PlotSeries series in attach)
+        {
+            if (series.IsRemoved || series.Plottable is not null)
+                continue;
+
+            AttachSeries(series, plot);
+        }
+
+        RefreshXMapping();
+        OnSeriesLayoutChanged();
+    }
+
+    /// <summary>句柄创建后补投一次“挂接排队曲线”的消息（处理与 <see cref="OnHandleCreated"/> 的竞争）。</summary>
+    private void PostPendingAttach()
+    {
+        if (!IsHandleCreated)
+            return;
+
+        try
+        {
+            BeginInvoke(_attachPendingAction);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            // 句柄正在销毁：数据/曲线已无意义
+        }
+    }
+
+    /// <summary>句柄创建后补投一次“执行排队界面操作”的消息（处理与 <see cref="OnHandleCreated"/> 的竞争）。</summary>
+    private void PostPendingUiActions()
+    {
+        if (!IsHandleCreated)
+            return;
+
+        try
+        {
+            BeginInvoke(_runPendingUiActionsAction);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            // 句柄正在销毁：操作已无意义
+        }
     }
 
     #region 事件
@@ -437,6 +686,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _defaultStartTime;
         set
         {
+            if (_designerFallback)
+            {
+                _defaultStartTime = value;
+                return;
+            }
+
             if (value is null && _xAxisUnit == XAxisUnit.AbsoluteTime)
                 EnsureAbsoluteStartTimes(defaultStartTime: null);
 
@@ -473,6 +728,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             _maxFramesPerSecond = Math.Max(0, value);
             Interlocked.Exchange(ref _minFlushIntervalTicks, _maxFramesPerSecond > 0 ? Stopwatch.Frequency / _maxFramesPerSecond : 0);
 
+            if (_designerFallback)
+                return;
+
             if (_maxFramesPerSecond > 0 && _frameTimer is null && !IsDisposed && !DesignMode)
                 _frameTimer = new HighResolutionTimer(OnFrameTimerDue);
         }
@@ -488,12 +746,22 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         set
         {
             _showLegend = value;
+
+            if (_designerFallback)
+                return;
+
             ApplyLegend();
             RequestRender();
         }
     }
 
-    private void ApplyLegend() => _canvas.Plot.Legend.IsVisible = _showLegend;
+    private void ApplyLegend()
+    {
+        if (_designerFallback || _canvas is null)
+            return;
+
+        _canvas.Plot.Legend.IsVisible = _showLegend;
+    }
 
     /// <summary>把百分比接口解析为目标模式：显式指定优先；手动模式统一落到暂停之前的自动滚动模式。</summary>
     private ScrollingMode ResolvePercentMode(ScrollingMode? mode)
@@ -505,7 +773,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>按当前模式与参数重新计算坐标轴（手动模式只重绘，不改变视图）。</summary>
     private void ReapplyAxes()
     {
-        if (IsDisposed || Disposing)
+        if (IsDisposed || Disposing || _designerFallback)
             return;
 
         ApplyAutoScroll();
@@ -521,8 +789,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [Description("是否在右键菜单中显示滚动模式勾选项。")]
     public bool ShowModeMenuItems
     {
-        get => _plotMenu.ShowModeItems;
-        set => _plotMenu.ShowModeItems = value;
+        get => _plotMenu?.ShowModeItems ?? _showModeItemsFallback;
+        set
+        {
+            _showModeItemsFallback = value;
+
+            if (_plotMenu is not null)
+                _plotMenu.ShowModeItems = value;
+        }
     }
 
     /// <summary>停止滚动（切换到手动模式），保持当前视图。</summary>
@@ -535,6 +809,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         if (mode != ScrollingMode.Manual)
             _lastAutoScrollMode = mode;
+
+        if (_designerFallback)
+        {
+            _xOffset = 0;
+            return;
+        }
 
         // 重新选择模式 = 回到该模式的默认视图：
         // 选择“堆叠模式”即恢复 0%（显示全部数据），选择“跟随模式”即恢复默认窗口 30%，
@@ -576,27 +856,27 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>默认曲线的数据点数量（单曲线接口；多曲线时请使用各 <see cref="PlotSeries.DataCount"/>）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public int DataCount => _defaultSeries.DataCount;
+    public int DataCount => _defaultSeries?.DataCount ?? 0;
 
     /// <summary>默认曲线最新数据点的 X 坐标（点数单位下从 1 开始、等于点数；时间单位下为距 <see cref="TimeReference"/> 的秒数）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public double LatestX => _defaultSeries.LatestX;
+    public double LatestX => _defaultSeries?.LatestX ?? 0;
 
     /// <summary>默认曲线最新数据点的 Y 值。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public double LatestValue => _defaultSeries.LatestValue;
+    public double LatestValue => _defaultSeries?.LatestValue ?? double.NaN;
 
     /// <summary>默认曲线中被忽略的非有限值数量（NaN / Infinity）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public int SkippedValueCount => _defaultSeries.SkippedValueCount;
+    public int SkippedValueCount => _defaultSeries?.SkippedValueCount ?? 0;
 
     /// <summary>默认曲线全部数据的 Y 值。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public IReadOnlyList<double> Values => _defaultSeries.Values;
+    public IReadOnlyList<double> Values => _defaultSeries?.Values ?? Array.Empty<double>();
 
     /// <summary>
     /// 向默认曲线添加一个数据点。X 坐标自动递增（第 1 个点为 1，第 n 个点为 n）。
@@ -604,30 +884,54 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 由 UI 线程按帧整批写入（无论调用多频繁，窗口消息队列里最多只有一条合并写入消息）。
     /// </summary>
     /// <param name="y">Y 值，非有限值会被忽略。</param>
-    public void AddValue(double y) => AppendValue(_defaultSeries, y);
+    public void AddValue(double y)
+    {
+        if (_designerFallback)
+            return;
+
+        AppendValue(_defaultSeries, y);
+    }
 
     /// <summary>向默认曲线批量添加数据点。</summary>
     /// <param name="values">Y 值集合，非有限值会被忽略。</param>
-    public void AddValues(IEnumerable<double> values) => _defaultSeries.AddValues(values);
+    public void AddValues(IEnumerable<double> values)
+    {
+        if (_designerFallback)
+            return;
+
+        _defaultSeries.AddValues(values);
+    }
 
     /// <summary>向默认曲线批量添加数据点。</summary>
     /// <param name="values">Y 值数组。</param>
-    public void AddValues(params double[] values) => _defaultSeries.AddValues(values);
+    public void AddValues(params double[] values)
+    {
+        if (_designerFallback)
+            return;
+
+        _defaultSeries.AddValues(values);
+    }
 
     /// <summary>
     /// 向默认曲线批量添加数据点。UI 线程上直接写入、不复制调用方的数据；
     /// 非 UI 线程上会先复制到内部待处理列表（调用返回后即可复用传入的缓冲区）。
     /// </summary>
     /// <param name="values">Y 值，非有限值会被忽略。</param>
-    public void AddValues(ReadOnlySpan<double> values) => AppendValues(_defaultSeries, values);
+    public void AddValues(ReadOnlySpan<double> values)
+    {
+        if (_designerFallback)
+            return;
+
+        AppendValues(_defaultSeries, values);
+    }
 
     /// <summary>清空全部曲线的数据（曲线本身保留），并把坐标轴恢复到初始范围。可以在任意线程调用。</summary>
     public void ClearData()
     {
-        if (IsDisposed || Disposing)
+        if (IsDisposed || Disposing || _designerFallback)
             return;
 
-        if (InvokeRequired)
+        if (!IsOnUiThread)
         {
             // 与跨线程写入走同一个队列，保证“写入 → 清空 → 写入”的顺序不被打乱：
             // 清空之前排队的数据直接丢弃，之后到达的数据在清空完成后再追加
@@ -690,26 +994,36 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </exception>
     public PlotSeries AddSeries(string name, ScottPlot.Color? color = null, DateTime? startTime = null)
     {
-        if (InvokeRequired && IsHandleCreated)
-            return (PlotSeries)Invoke(new Func<PlotSeries>(() => AddSeries(name, color, startTime)));
-
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
-
-        if (_xAxisUnit == XAxisUnit.AbsoluteTime && startTime is null && _defaultStartTime is null)
+        // 设计器兜底：允许用户代码在 Form 构造函数里创建曲线（控件本身只显示占位视图）。
+        // 曲线只存在于设计时实例的内存里，不会被序列化到 Form。
+        if (_designerFallback)
         {
-            throw new InvalidOperationException(
-                "绝对时间单位下添加曲线需要起始时间：请传入 startTime 参数，或先设置控件的 DefaultStartTime。");
+            PlotSeries designerSeries = CreateSeries(name, color, startTime);
+
+            lock (_pendingLock)
+                _pendingAttach.Add(designerSeries);
+
+            return designerSeries;
         }
 
-        PlotSeries series = new(this, name ?? string.Empty, color ?? SeriesPalette.GetColor(_seriesCreated), isDefault: false)
+        if (!IsOnUiThread)
         {
-            OwnStartTime = startTime,
-        };
-        _seriesCreated++;
+            if (IsHandleCreated)
+                return (PlotSeries)Invoke(new Func<PlotSeries>(() => AddSeries(name, color, startTime)));
 
-        lock (_pendingLock)
-            _series.Add(series);
+            // 句柄创建前从其它线程添加：先把曲线加入列表（数据会进入待处理队列），
+            // 挂接 Plot 与重算坐标轴推迟到 OnHandleCreated 的 UI 线程上执行
+            PlotSeries pending = CreateSeries(name, color, startTime);
 
+            lock (_pendingLock)
+                _pendingAttach.Add(pending);
+
+            // 与 OnHandleCreated 竞争：句柄可能刚好在判断线程之后创建
+            PostPendingAttach();
+            return pending;
+        }
+
+        PlotSeries series = CreateSeries(name, color, startTime);
         AttachSeries(series, _canvas.Plot);
 
         // 新曲线没有数据，通常不影响坐标轴，只需重绘（图例）；
@@ -722,14 +1036,51 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         return series;
     }
 
+    /// <summary>创建曲线并加入 <see cref="_series"/>（调用方负责判断线程与是否立即挂接）。</summary>
+    private PlotSeries CreateSeries(string name, ScottPlot.Color? color, DateTime? startTime)
+    {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+        if (_xAxisUnit == XAxisUnit.AbsoluteTime && startTime is null && _defaultStartTime is null)
+        {
+            throw new InvalidOperationException(
+                "绝对时间单位下添加曲线需要起始时间：请传入 startTime 参数，或先设置控件的 DefaultStartTime。");
+        }
+
+        PlotSeries series;
+
+        lock (_pendingLock)
+        {
+            int colorIndex = _seriesCreated++;
+            series = new PlotSeries(this, name ?? string.Empty, color ?? SeriesPalette.GetColor(colorIndex), isDefault: false)
+            {
+                OwnStartTime = startTime,
+            };
+            _series.Add(series);
+        }
+
+        return series;
+    }
+
     /// <summary>
-    /// 在 UI 线程上执行（非 UI 线程同步切换；句柄尚未创建时直接执行）。
+    /// 在 UI 线程上执行（非 UI 线程同步切换；句柄尚未创建时排入队列，在 <see cref="OnHandleCreated"/> 中执行，
+    /// 避免后台线程直接修改 Plot / 控件状态）。
     /// 操作本身抛出的异常（例如绝对时间单位下清除起始时间）原样抛给调用方；切换线程时句柄正在销毁则忽略。
     /// </summary>
     internal void RunOnUiThread(Action action)
     {
-        if (InvokeRequired && IsHandleCreated)
+        if (!IsOnUiThread)
         {
+            if (!IsHandleCreated)
+            {
+                lock (_pendingLock)
+                    _pendingUiActions.Enqueue(action);
+
+                // 与 OnHandleCreated 竞争：句柄可能刚好在判断线程之后创建
+                PostPendingUiActions();
+                return;
+            }
+
             ExceptionDispatchInfo? failure = null;
 
             try
@@ -760,11 +1111,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     internal void AppendValue(PlotSeries series, double y)
     {
-        if (IsDisposed || Disposing || series.IsRemoved)
+        if (_designerFallback || IsDisposed || Disposing || series.IsRemoved)
             return;
 
         // 先判断线程再处理：UI 线程（最常见的调用方式）不产生任何闭包 / 委托分配
-        if (InvokeRequired)
+        if (!IsOnUiThread)
         {
             lock (_pendingLock)
                 series.PendingValues.Add(y);
@@ -790,10 +1141,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     internal void AppendValues(PlotSeries series, ReadOnlySpan<double> values)
     {
-        if (values.IsEmpty || IsDisposed || Disposing || series.IsRemoved)
+        if (_designerFallback || values.IsEmpty || IsDisposed || Disposing || series.IsRemoved)
             return;
 
-        if (InvokeRequired)
+        if (!IsOnUiThread)
         {
             lock (_pendingLock)
                 series.PendingValues.AddRange(values);
@@ -830,10 +1181,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     internal void ClearSeries(PlotSeries series)
     {
-        if (IsDisposed || Disposing || series.IsRemoved)
+        if (_designerFallback || IsDisposed || Disposing || series.IsRemoved)
             return;
 
-        if (InvokeRequired)
+        if (!IsOnUiThread)
         {
             // 与该曲线的跨线程写入走同一个队列：清空之前排队的数据丢弃，之后到达的数据在清空后追加
             lock (_pendingLock)
@@ -860,7 +1211,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         RunOnUiThread(() =>
         {
-            if (series.IsRemoved || IsDisposed)
+            if (series.IsRemoved || IsDisposed || _designerFallback)
                 return;
 
             lock (_pendingLock)
@@ -871,7 +1222,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 series.PendingClear = false;
             }
 
-            if (series.Plottable is { } plottable)
+            if (series.Plottable is { } plottable && _canvas is not null)
                 _canvas.Plot.Remove(plottable);
 
             series.Plottable = null;
@@ -884,8 +1235,13 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>曲线的显示状态或曲线集合发生变化：按当前可见曲线重新计算坐标轴。</summary>
     internal void OnSeriesLayoutChanged()
     {
-        if (IsDisposed || Disposing)
+        if (IsDisposed || Disposing || _designerFallback)
             return;
+
+        // 曲线的显示 / 删除会改变堆叠模式的右端：按“显示最新 N%”的语义重新固定原点，
+        // 否则隐藏 / 删除最长的一条后，旧原点可能已超过新的右端，剩余数据整段落在视图之外。
+        if (_mode == ScrollingMode.Stacked)
+            PinStackedOrigin();
 
         if (!IsUserGestureInProgress || !_axisOptions.PauseAutoScrollDuringGesture)
             ApplyAutoScroll();
@@ -1095,6 +1451,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (unit == _xAxisUnit)
             return;
 
+        if (_designerFallback)
+        {
+            _xAxisUnit = unit;
+            return;
+        }
+
         // 绝对时间只认明确设置的起始时间：先检查，缺少时抛异常、单位保持不变
         if (unit == XAxisUnit.AbsoluteTime)
             EnsureAbsoluteStartTimes(_defaultStartTime);
@@ -1141,6 +1503,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </summary>
     private void ApplyTickGenerator()
     {
+        if (_designerFallback || _canvas is null)
+            return;
+
         Plot? plot = _canvas.Plot;
         if (plot is null)
             return;
@@ -1178,7 +1543,6 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Control Canvas => _canvas;
-
     /// <summary>
     /// 已移除：控件不再内嵌 <see cref="ScottPlot.WinForms.FormsPlot"/>（改为自绘画布，见 <see cref="Canvas"/>）。
     /// 绘图对象、输入处理、菜单等请直接使用本控件实现的 <see cref="IPlotControl"/> 成员。
@@ -1204,20 +1568,24 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>默认曲线的 ScottPlot 图元（可自行修改颜色、线宽等样式；其它曲线见 <see cref="PlotSeries.Signal"/>）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public ScottPlot.Plottables.Signal? Signal => _defaultSeries.Plottable;
+    public ScottPlot.Plottables.Signal? Signal => _defaultSeries?.Plottable;
 
     /// <inheritdoc />
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Plot Plot => _canvas.Plot;
+    public Plot Plot => _canvas?.Plot!;
 
     /// <inheritdoc />
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public IMultiplot Multiplot
     {
-        get => _canvas.Multiplot;
-        set => _canvas.Multiplot = value;
+        get => _canvas?.Multiplot!;
+        set
+        {
+            if (_canvas is not null)
+                _canvas.Multiplot = value;
+        }
     }
 
     /// <inheritdoc />
@@ -1225,14 +1593,18 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public IPlotMenu? Menu
     {
-        get => _canvas.Menu;
-        set => _canvas.Menu = value;
+        get => _canvas?.Menu;
+        set
+        {
+            if (_canvas is not null)
+                _canvas.Menu = value;
+        }
     }
 
     /// <inheritdoc />
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public UserInputProcessor UserInputProcessor => _canvas.UserInputProcessor;
+    public UserInputProcessor UserInputProcessor => _canvas?.UserInputProcessor!;
 
     /// <summary>
     /// 显示缩放比例（DPI / 96），默认按画布所在显示器检测。
@@ -1242,19 +1614,23 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public float DisplayScale
     {
-        get => _canvas.DisplayScale;
-        set => _canvas.DisplayScale = value;
+        get => _canvas?.DisplayScale ?? DeviceDpi / 96f;
+        set
+        {
+            if (_canvas is not null)
+                _canvas.DisplayScale = value;
+        }
     }
 
     /// <summary>软件渲染，不使用 GPU 上下文（始终为 null，与 FormsPlot 相同）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public GRContext GRContext => _canvas.GRContext;
+    public GRContext GRContext => _canvas?.GRContext!;
 
     /// <inheritdoc />
     public override void Refresh()
     {
-        if (_canvas.IsDisposed)
+        if (_designerFallback || _canvas is null || _canvas.IsDisposed)
             return;
 
         // 只同步重绘画布：不重绘父控件背景，避免大面积背景闪烁
@@ -1268,16 +1644,21 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </summary>
     public void RequestRender()
     {
-        if (_canvas.IsDisposed || Disposing)
+        if (_designerFallback || _canvas is null || _canvas.IsDisposed || Disposing)
             return;
 
-        // 只让画布失效（不连带父控件），避免每次刷新都重绘父控件背景造成大面积闪烁
-        _canvas.Invalidate();
+        // 只让画布失效（不连带父控件），避免每次刷新都重绘父控件背景造成大面积闪烁。
+        // 同一帧内已经请求过时不再重复调用 Invalidate（WinForms 会合并 WM_PAINT，
+        // 重复调用只会多分配约 32 字节，高频逐点写入时这也是可观的 GC 来源）。
+        _canvas.RequestRepaint();
     }
 
     /// <inheritdoc />
     public void Reset()
     {
+        if (_designerFallback || _canvas is null)
+            return;
+
         // 新建绘图对象并清空全部曲线的数据；曲线本身（名称、颜色等）保留并挂接到新的绘图对象上
         foreach (PlotSeries series in _series)
         {
@@ -1292,6 +1673,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         ApplyDefaultFont();
         AttachDataToCurrentPlot();
         RefreshXMapping();
+
+        // 数据已清空：堆叠原点必须重新固定为零，否则下次从 0 开始写入时
+        // X 轴仍停留在 Reset 前的原点（显示百分比 < 100 时新数据会落在视图之外）
+        PinStackedOrigin();
+
         ApplyAutoScroll();
         RememberLimits();
         RequestRender();
@@ -1306,6 +1692,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     {
         ArgumentNullException.ThrowIfNull(plot);
 
+        if (_designerFallback || _canvas is null)
+            return;
+
         _canvas.Reset(plot, disposeOldPlot);
         _xOffset = 0;
         ApplyDefaultFont();
@@ -1316,17 +1705,32 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     }
 
     /// <inheritdoc />
-    public float DetectDisplayScale() => _canvas.DetectDisplayScale();
+    public float DetectDisplayScale() => _canvas?.DetectDisplayScale() ?? DeviceDpi / 96f;
 
     /// <inheritdoc />
-    public void SetCursor(PlotCursor cursor) => _canvas.SetCursor(cursor);
+    public void SetCursor(PlotCursor cursor)
+    {
+        if (_canvas is not null)
+            _canvas.SetCursor(cursor);
+    }
 
     /// <inheritdoc />
-    public void ShowContextMenu(Pixel position) => _canvas.ShowContextMenu(position);
+    public void ShowContextMenu(Pixel position)
+    {
+        if (_canvas is not null)
+            _canvas.ShowContextMenu(position);
+    }
 
     /// <summary>把像素坐标转换为数据坐标。</summary>
-    public Coordinates GetCoordinates(Pixel pixel) =>
-        Plot.GetCoordinates(pixel, Plot.Axes.Bottom, Plot.Axes.Left);
+    public Coordinates GetCoordinates(Pixel pixel)
+    {
+        if (_designerFallback || _canvas is null)
+            return new Coordinates(double.NaN, double.NaN);
+
+        Plot plot = _canvas.Plot;
+        EnsureAxesCurrent(plot);
+        return plot.GetCoordinates(pixel, _xAxis!, _yAxis!);
+    }
 
     #endregion
 
@@ -1343,8 +1747,15 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (args.Handled)
             return;
 
-        FormHelp dialog = new();
-        dialog.Show();
+        // 使用带完整中文说明的 PlotHelpDialog（标题、模式、X 轴单位、鼠标操作、数据接口），
+        // 而不是旧版 ScottPlot.FormHelp（只有鼠标操作提示）；关闭后自动释放。
+        PlotHelpDialog dialog = new(args.Content);
+        dialog.FormClosed += (_, _) => dialog.Dispose();
+
+        if (FindForm() is { } owner)
+            dialog.Show(owner);
+        else
+            dialog.Show();
     }
 
     #endregion
@@ -1353,6 +1764,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     private void AttachDataToCurrentPlot()
     {
+        if (_designerFallback || _canvas is null)
+            return;
+
         Plot? plot = _canvas.Plot;
         if (plot is null)
             return;
@@ -1363,12 +1777,41 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         ApplyLegend();
         ApplyTickGenerator();
         HookRenderFinished(plot);
+
+        // 新 Plot 的默认坐标轴：缓存引用供逐点写入使用（见 _xAxis / _yAxis）
+        _xAxis = plot.Axes.Bottom;
+        _yAxis = plot.Axes.Left;
     }
+
+    /// <summary>
+    /// 确认缓存的默认坐标轴仍属于当前 Plot（用户可能替换 / 删除过坐标轴）：
+    /// 使用 <see cref="ICollection{T}.Contains"/> 检查（List 的接口实现，不产生分配），
+    /// 只有真的发生变化时才重新调用 Bottom / Left（各分配约 40 字节）。
+    /// </summary>
+    private void EnsureAxesCurrent(Plot plot)
+    {
+        if (_xAxis is null || !ContainsAxis(plot.Axes.GetXAxes(), _xAxis))
+            _xAxis = plot.Axes.Bottom;
+
+        if (_yAxis is null || !ContainsAxis(plot.Axes.GetYAxes(), _yAxis))
+            _yAxis = plot.Axes.Left;
+    }
+
+    private static bool ContainsAxis<T>(IEnumerable<T> axes, T axis) where T : class =>
+        axes is ICollection<T> collection ? collection.Contains(axis) : axes.Contains(axis);
 
     /// <summary>为曲线在指定 Plot 上创建图元（Reset 替换 Plot 后重新调用；用户直接改过的样式会保留）。</summary>
     private void AttachSeries(PlotSeries series, Plot plot)
     {
+        if (_designerFallback)
+            return;
+
         series.CaptureStyle();
+
+        // 用户在 Reset(当前 Plot, disposeOldPlot: false) 里传入同一个 Plot 时，旧图元仍在 Plot 中：
+        // 先移除再新建，否则同一条曲线会被画两次、图例出现重复项。传入新 Plot 时这里是无操作。
+        if (series.Plottable is { } previous)
+            plot.Remove(previous);
 
         // 数据源直接引用曲线的内部列表与极值金字塔，后续追加数据无需重建；
         // 每个像素列用金字塔求极值，单帧耗时基本不随数据量增长（渲染结果与 ScottPlot 内置数据源逐像素一致）。
@@ -1386,7 +1829,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </summary>
     private void HookRenderFinished(Plot plot)
     {
-        if (ReferenceEquals(_renderHookedPlot, plot))
+        if (_designerFallback || ReferenceEquals(_renderHookedPlot, plot))
             return;
 
         UnhookRenderFinished();
@@ -1408,6 +1851,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>使用支持中文的字体，保证标题、坐标轴与图例中的中文正常显示。</summary>
     private void ApplyDefaultFont()
     {
+        if (_designerFallback || _canvas is null)
+            return;
+
         try
         {
             _canvas.Plot.Font.Set(DefaultFontName);
@@ -1420,7 +1866,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     private void ApplyAutoScroll()
     {
-        if (_applyingLimits)
+        if (_applyingLimits || _designerFallback || _canvas is null)
             return;
 
         Plot? plot = _canvas.Plot;
@@ -1509,6 +1955,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     private void ApplyLimits(double xMin, double xMax, double yMin, double yMax)
     {
+        if (_designerFallback || _canvas is null)
+            return;
+
         Plot? plot = _canvas.Plot;
         if (plot is null)
             return;
@@ -1516,7 +1965,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         _applyingLimits = true;
         try
         {
-            plot.Axes.SetLimits(xMin, xMax, yMin, yMax);
+            EnsureAxesCurrent(plot);
+            plot.Axes.SetLimits(xMin, xMax, yMin, yMax, _xAxis!, _yAxis!);
         }
         finally
         {
@@ -1778,11 +2228,15 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     private AxisLimits? ReadLimits()
     {
+        if (_designerFallback || _canvas is null)
+            return null;
+
         Plot? plot = _canvas.Plot;
         if (plot is null)
             return null;
 
-        AxisLimits limits = plot.Axes.GetLimits();
+        EnsureAxesCurrent(plot);
+        AxisLimits limits = plot.Axes.GetLimits(_xAxis!, _yAxis!);
         return limits.IsReal ? limits : null;
     }
 
@@ -1852,8 +2306,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
         catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
         {
-            // 句柄尚未创建或正在销毁：撤销标记，下一次写入时再投递
+            // 句柄尚未创建或正在销毁：撤销标记，句柄创建后由 OnHandleCreated 补投
             Interlocked.Exchange(ref _flushPostedAt, 0);
+            Interlocked.Exchange(ref _flushRetryOnHandleCreated, 1);
         }
     }
 
@@ -1984,6 +2439,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>刚请求的重绘是否会真正发生（不会发生时合并写入不能等渲染完成通知）。</summary>
     private bool IsRenderExpected()
     {
+        if (_designerFallback || _canvas is null)
+            return false;
+
         PlotCanvas canvas = _canvas;
 
         if (canvas.IsDisposed || !canvas.IsHandleCreated || !canvas.Visible || canvas.Width <= 0 || canvas.Height <= 0)
@@ -1992,7 +2450,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (FindForm() is { WindowState: FormWindowState.Minimized })
             return false;
 
-        return _canvas.Plot.RenderManager.EnableRendering;
+        return canvas.Plot.RenderManager.EnableRendering;
     }
 
     private void InitializeComponent()
@@ -2005,10 +2463,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     {
         if (disposing)
         {
-            _canvas.MouseDown -= OnPlotMouseDown;
-            _canvas.MouseMove -= OnPlotMouseMove;
-            _canvas.MouseUp -= OnPlotMouseUp;
-            _canvas.MouseWheel -= OnPlotMouseWheel;
+            if (_canvas is not null)
+            {
+                _canvas.MouseDown -= OnPlotMouseDown;
+                _canvas.MouseMove -= OnPlotMouseMove;
+                _canvas.MouseUp -= OnPlotMouseUp;
+                _canvas.MouseWheel -= OnPlotMouseWheel;
+            }
+
             UnhookRenderFinished();
 
             _frameTimer?.Dispose();

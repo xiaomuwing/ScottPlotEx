@@ -37,6 +37,8 @@ internal sealed class PlotCanvas : Control, IPlotControl
     private SKSurface? _surface;
     private Size _surfaceSize;
     private float _displayScale = 1f;
+    private int _repaintRequested;
+    private bool _renderFallback;
 
     /// <summary>创建画布（含默认 Plot、Multiplot 与输入处理器）。</summary>
     public PlotCanvas()
@@ -151,38 +153,82 @@ internal sealed class PlotCanvas : Control, IPlotControl
 
     #region 绘制
 
+    /// <summary>
+    /// 请求合并重绘：同一帧内重复调用只生效一次。
+    /// WinForms 本身会合并 WM_PAINT，但每次 <see cref="Control.Invalidate()"/> 都会分配约 32 字节；
+    /// 高频逐点写入时（每点一次 RequestRender）这些分配会形成可观的 GC 压力。
+    /// </summary>
+    internal void RequestRepaint()
+    {
+        if (Interlocked.Exchange(ref _repaintRequested, 1) == 0)
+            Invalidate();
+    }
+
     /// <inheritdoc />
     protected override void OnPaint(PaintEventArgs e)
     {
+        // 先清标志：绘制过程中再次请求重绘（例如 DataChanged 处理器里继续写数据）仍会触发下一帧
+        Interlocked.Exchange(ref _repaintRequested, 0);
+
+        if (_renderFallback)
+        {
+            DrawRenderFallback(e.Graphics);
+            base.OnPaint(e);
+            return;
+        }
+
         Size size = ClientSize;
 
         if (size.Width > 0 && size.Height > 0)
         {
-            SKSurface surface = EnsureSurface(size);
-            bool singlePass = SinglePassRendering && IsSinglePlot() && Plot.RenderManager.EnableRendering;
-
-            RenderFrame(surface, singlePass);
-
-            // 第一遍渲染时 AxisLimitsChanged 的处理器（联动坐标轴、用户代码）又改动了坐标轴：
-            // 按 ScottPlot 原本的方式再渲染，直到坐标轴稳定，保证画面反映最终范围
-            if (singlePass && AxisLimitsChangedSinceLastRender(Plot))
-                RenderFrame(surface, singlePass: false);
-
-            surface.Canvas.Flush();
-
-            IntPtr hdc = e.Graphics.GetHdc();
             try
             {
-                BitBlt(hdc, 0, 0, size.Width, size.Height, _memoryDc, 0, 0, SrcCopy);
+                SKSurface surface = EnsureSurface(size);
+                bool singlePass = SinglePassRendering && IsSinglePlot() && Plot.RenderManager.EnableRendering;
+
+                RenderFrame(surface, singlePass);
+
+                // 第一遍渲染时 AxisLimitsChanged 的处理器（联动坐标轴、用户代码）又改动了坐标轴：
+                // 按 ScottPlot 原本的方式再渲染，直到坐标轴稳定，保证画面反映最终范围
+                if (singlePass && AxisLimitsChangedSinceLastRender(Plot))
+                    RenderFrame(surface, singlePass: false);
+
+                surface.Canvas.Flush();
+
+                IntPtr hdc = e.Graphics.GetHdc();
+                try
+                {
+                    BitBlt(hdc, 0, 0, size.Width, size.Height, _memoryDc, 0, 0, SrcCopy);
+                }
+                finally
+                {
+                    e.Graphics.ReleaseHdc(hdc);
+                }
             }
-            finally
+            catch (Exception exception) when (DesignerSupport.IsNativeLibraryFailure(exception))
             {
-                e.Graphics.ReleaseHdc(hdc);
+                // 设计器 / 缺少 SkiaSharp 原生库：不要抛到设计器，画一段说明文字即可
+                _renderFallback = true;
+                ReleaseSurface();
+                DrawRenderFallback(e.Graphics);
             }
         }
 
         // 最后再触发 Paint 事件：订阅方画在曲线之上
         base.OnPaint(e);
+    }
+
+    private void DrawRenderFallback(Graphics graphics)
+    {
+        graphics.Clear(BackColor);
+        TextRenderer.DrawText(
+            graphics,
+            "ScrollingPlotControl\r\n\r\n无法加载 SkiaSharp 原生库（libSkiaSharp）。\r\n" +
+            "设计器只显示占位视图；运行时请确保输出目录包含 runtimes/win-*/native/libSkiaSharp.dll。",
+            Font,
+            ClientRectangle,
+            SystemColors.GrayText,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
     }
 
     /// <summary>

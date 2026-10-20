@@ -90,6 +90,6 @@ public static class PlotHelpContent
         · ShowAllData()：恢复显示全部数据（堆叠显示百分比设为 100%）
         · 重新选择模式会回到该模式的默认视图：选择堆叠模式 = 100%（显示全部数据），
           选择跟随模式 = 默认 30% 窗口（可用 AxisOptions.ResetDisplayPercentOnModeChange 关闭）
-        · 所有 IPlotControl 接口（Plot、Menu、UserInputProcessor 等）均已转发到内嵌的 ScottPlot 控件。
+        · 所有 IPlotControl 接口（Plot、Menu、UserInputProcessor 等）均由本控件与画布实现（不再内嵌 FormsPlot）。
         """;
 }
