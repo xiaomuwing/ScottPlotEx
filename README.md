@@ -60,6 +60,9 @@ dotnet run --project src\ScottPlotEx.Demo -- --multiseries   # 直接打开“�
 <ProjectReference Include="..\ScottPlotEx.Controls\ScottPlotEx.Controls.csproj" />
 ```
 
+控件库的目标框架是 `net8.0-windows`，引用方同样只需 `net8.0-windows`（或 `net8.0-windows7.0`），
+不必把 TFM 写成 `net8.0-windows10.0.19041.0` 这类带 Windows SDK 版本的形式。
+
 ```csharp
 // 1) 把控件放到窗体上（设计器工具箱中名为 ScrollingPlotControl）
 var plot = new ScrollingPlotControl { Dock = DockStyle.Fill };
@@ -732,7 +735,7 @@ dotnet test ScottPlotEx.sln --filter "FullyQualifiedName~Flicker"
 
 ## 依赖
 
-- .NET 8（`net8.0-windows10.0.19041.0`）
+- .NET 8（`net8.0-windows`）
 - [ScottPlot.WinForms 5.1.59](https://www.nuget.org/packages/ScottPlot.WinForms)（含 ScottPlot 5、SkiaSharp）
 - 测试项目：xunit 2.9.3 + Microsoft.NET.Test.Sdk
 

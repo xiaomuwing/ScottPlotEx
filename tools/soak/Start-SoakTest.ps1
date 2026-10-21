@@ -34,7 +34,7 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $projectPath = Join-Path $repositoryRoot 'tools\ScottPlotEx.SoakTest\ScottPlotEx.SoakTest.csproj'
-$exePath = Join-Path $repositoryRoot 'tools\ScottPlotEx.SoakTest\bin\Release\net8.0-windows10.0.19041.0\ScottPlotEx.SoakTest.exe'
+$exePath = Join-Path $repositoryRoot 'tools\ScottPlotEx.SoakTest\bin\Release\net8.0-windows\ScottPlotEx.SoakTest.exe'
 
 if (-not (Test-Path $exePath)) {
     Write-Host '未找到已构建的压测程序，正在以 Release 配置构建……'
