@@ -229,6 +229,7 @@ public sealed class MultiSeriesTestForm : Form
             else
                 _plot.FollowWindowDuration = TimeSpan.FromSeconds((double)_followWindow.Value);
         };
+        _maxFps.Value = Math.Clamp(_plot.MaxFramesPerSecond, (int)_maxFps.Minimum, (int)_maxFps.Maximum); // 显示控件的默认帧率上限（60）
         _maxFps.ValueChanged += (_, _) => _plot.MaxFramesPerSecond = (int)_maxFps.Value;
         _legend.CheckedChanged += (_, _) => _plot.ShowLegend = _legend.Checked;
 

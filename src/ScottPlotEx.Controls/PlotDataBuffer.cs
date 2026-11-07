@@ -8,13 +8,26 @@ namespace ScottPlotEx.Controls;
 /// 因此 X 轴范围“0 ~ 数据点数 + 2”恰好包含全部数据点并在右侧保留 2 个数据点的余量。
 /// 时间单位下由控件设置为“起始时间距参考时刻的秒数”与“采样间隔（秒）”。
 /// 内部维护一个极值金字塔，任意 X 范围的取值范围查询开销与范围长度无关。
+/// <para>
+/// 缺失值（NaN、±Infinity、绝对值超过 <see cref="MaxAbsoluteValue"/> 的值）按 NaN 保存、占一个下标：
+/// 之后的数据点 X 不会错位（多条曲线按序号 / 按时间的对齐保持不变），绘制时在缺失处断开，取值范围统计跳过缺失值。
+/// </para>
 /// </summary>
 public sealed class PlotDataBuffer
 {
+    /// <summary>
+    /// 绝对值超过它的数据按缺失值处理：接近 <see cref="double.MaxValue"/> 的哨兵值会让坐标轴跨度溢出、绘制失败。
+    /// </summary>
+    public const double MaxAbsoluteValue = 1e300;
+
     private readonly List<double> _values = [];
     private readonly MinMaxPyramid _pyramid;
     private double _min = double.NaN;
     private double _max = double.NaN;
+    private int _finiteCount;
+
+    /// <summary>连续缺失值的下标区间 [Start, End]（按下标递增，只追加），用于断线绘制与跳过缺失值的查询。</summary>
+    private readonly List<(int Start, int End)> _missingRuns = [];
     private double _xStart = 1.0;
     private double _xStep = 1.0;
 
@@ -42,8 +55,14 @@ public sealed class PlotDataBuffer
     /// <summary>数据点数量。</summary>
     public int Count => _values.Count;
 
-    /// <summary>被忽略的非有限值（NaN / Infinity）数量。</summary>
+    /// <summary>缺失值数量（NaN、±Infinity、绝对值超过 <see cref="MaxAbsoluteValue"/> 的值；按 NaN 占位保存）。</summary>
     public int SkippedCount { get; private set; }
+
+    /// <summary>有效（非缺失）数据点的数量。</summary>
+    public int FiniteCount => _finiteCount;
+
+    /// <summary>连续缺失值的下标区间（按下标递增）。</summary>
+    internal ReadOnlySpan<(int Start, int End)> MissingRuns => CollectionsMarshal.AsSpan(_missingRuns);
 
     /// <summary>第一个数据点（下标 0）的 X 坐标。默认 1（点数单位：第 n 个点 X = n）。</summary>
     /// <exception cref="ArgumentOutOfRangeException">不是有限值时抛出。</exception>
@@ -85,20 +104,31 @@ public sealed class PlotDataBuffer
     /// <summary>X 坐标 → 下标（不取整、不裁剪，可能为小数或超出现有数据范围）。</summary>
     public double GetIndex(double x) => (x - _xStart) / _xStep;
 
-    /// <summary>最新数据点的 Y 值，没有数据时返回 <see cref="double.NaN"/>。</summary>
+    /// <summary>最新数据点的 Y 值，没有数据时返回 <see cref="double.NaN"/>（最新的点是缺失值时同样为 NaN）。</summary>
     public double LatestValue => _values.Count > 0 ? _values[^1] : double.NaN;
 
-    /// <summary>添加一个数据点，非有限值会被忽略。</summary>
-    /// <returns>数据被接受时返回 true。</returns>
+    /// <summary>
+    /// 添加一个数据点。缺失值（NaN、±Infinity、绝对值超过 <see cref="MaxAbsoluteValue"/>）按 NaN 占位保存并计入 <see cref="SkippedCount"/>。
+    /// </summary>
+    /// <returns>总是 true（缺失值也占一个位置）。</returns>
     public bool Add(double y)
     {
-        if (!double.IsFinite(y))
+        if (!double.IsFinite(y) || Math.Abs(y) > MaxAbsoluteValue)
         {
+            int index = _values.Count;
+            _values.Add(double.NaN);
+            _pyramid.OnAppended(double.NaN);
             SkippedCount++;
-            return false;
+
+            if (_missingRuns.Count > 0 && _missingRuns[^1].End == index - 1)
+                _missingRuns[^1] = (_missingRuns[^1].Start, index);
+            else
+                _missingRuns.Add((index, index));
+
+            return true;
         }
 
-        if (_values.Count == 0)
+        if (_finiteCount == 0)
         {
             _min = y;
             _max = y;
@@ -111,9 +141,86 @@ public sealed class PlotDataBuffer
                 _max = y;
         }
 
+        _finiteCount++;
         _values.Add(y);
         _pyramid.OnAppended(y);
         return true;
+    }
+
+    /// <summary>下标处是否为缺失值。</summary>
+    internal bool IsMissing(int index) => (uint)index < (uint)_values.Count && double.IsNaN(_values[index]);
+
+    /// <summary>从 <paramref name="index"/> 起向后第一个有效数据点的下标；没有时返回 -1。</summary>
+    internal int NextFiniteIndex(int index)
+    {
+        if (index < 0)
+            index = 0;
+
+        if (index >= _values.Count)
+            return -1;
+
+        if (!double.IsNaN(_values[index]))
+            return index;
+
+        int run = FindRunContaining(index);
+        int next = run >= 0 ? _missingRuns[run].End + 1 : index + 1;
+        return next < _values.Count ? next : -1;
+    }
+
+    /// <summary>从 <paramref name="index"/> 起向前第一个有效数据点的下标；没有时返回 -1。</summary>
+    internal int PreviousFiniteIndex(int index)
+    {
+        if (index >= _values.Count)
+            index = _values.Count - 1;
+
+        if (index < 0)
+            return -1;
+
+        if (!double.IsNaN(_values[index]))
+            return index;
+
+        int run = FindRunContaining(index);
+        int previous = run >= 0 ? _missingRuns[run].Start - 1 : index - 1;
+        return previous >= 0 ? previous : -1;
+    }
+
+    /// <summary>离 <paramref name="index"/> 最近的有效数据点下标（距离相同时取前一个）；没有有效数据时返回 -1。</summary>
+    internal int NearestFiniteIndex(int index)
+    {
+        int next = NextFiniteIndex(index);
+        int previous = PreviousFiniteIndex(index);
+
+        if (previous < 0)
+            return next;
+
+        if (next < 0)
+            return previous;
+
+        return index - previous <= next - index ? previous : next;
+    }
+
+    /// <summary>第一个 End 不小于 <paramref name="index"/> 的缺失区间序号（区间按下标递增）；没有时返回区间数量。</summary>
+    internal int FirstMissingRunEndingAtOrAfter(int index)
+    {
+        int lo = 0;
+        int hi = _missingRuns.Count;
+
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (_missingRuns[mid].End < index)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+
+        return lo;
+    }
+
+    private int FindRunContaining(int index)
+    {
+        int run = FirstMissingRunEndingAtOrAfter(index);
+        return run < _missingRuns.Count && _missingRuns[run].Start <= index ? run : -1;
     }
 
     /// <summary>
@@ -178,22 +285,24 @@ public sealed class PlotDataBuffer
     {
         _values.Clear();
         _pyramid.Clear();
+        _missingRuns.Clear();
         _min = double.NaN;
         _max = double.NaN;
+        _finiteCount = 0;
         SkippedCount = 0;
     }
 
-    /// <summary>获取全部数据的取值范围。</summary>
+    /// <summary>获取全部数据的取值范围（跳过缺失值）。没有有效数据时返回 false。</summary>
     public bool TryGetValueRange(out double min, out double max)
     {
         min = _min;
         max = _max;
-        return _values.Count > 0;
+        return _finiteCount > 0;
     }
 
     /// <summary>
-    /// 获取指定 X 范围内数据的取值范围（用于跟随模式 / 裁剪后的堆叠模式按当前显示数据自动缩放 Y 轴）。
-    /// 基于极值金字塔，开销与范围内的点数无关。
+    /// 获取指定 X 范围内数据的取值范围（用于跟随模式 / 裁剪后的堆叠模式按当前显示数据自动缩放 Y 轴），跳过缺失值。
+    /// 基于极值金字塔，开销与范围内的点数无关。范围内没有有效数据时返回 false。
     /// </summary>
     public bool TryGetValueRange(double xMin, double xMax, out double min, out double max)
     {
@@ -203,7 +312,8 @@ public sealed class PlotDataBuffer
         if (!TryGetIndexRange(xMin, xMax, out int start, out int end))
             return false;
 
-        return _pyramid.Query(start, end + 1, out min, out max);
+        // 区间内全是缺失值时金字塔返回 min = +∞、max = −∞
+        return _pyramid.Query(start, end + 1, out min, out max) && min <= max;
     }
 
     /// <summary>

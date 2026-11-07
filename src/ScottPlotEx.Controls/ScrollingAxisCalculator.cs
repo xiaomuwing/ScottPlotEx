@@ -56,6 +56,34 @@ public static class ScrollingAxisCalculator
         double xOffset,
         double stackedOriginX,
         out double xMin,
+        out double xMax) =>
+        TryCalculateXWindow(mode, series, unit, options, xOffset, stackedOriginX, double.NaN, out xMin, out xMax);
+
+    /// <summary>
+    /// 计算 X 轴范围（多条曲线、任意 X 轴单位），可指定堆叠模式固定的右端（显示百分比大于 100 时的分阶段扩展）。
+    /// </summary>
+    /// <param name="mode">滚动模式。</param>
+    /// <param name="series">参与计算的曲线（可见且有数据）；为空时返回空视图。</param>
+    /// <param name="unit">X 轴单位。</param>
+    /// <param name="options">取值范围参数。</param>
+    /// <param name="xOffset">X 轴偏移量。</param>
+    /// <param name="stackedOriginX">堆叠模式固定的 X 轴原点。</param>
+    /// <param name="stackedRightX">
+    /// 堆叠模式固定的右端（见 <see cref="CalculateStackedRightLimit"/>）；NaN 表示不固定（右端 = 最新 X + 留白）。
+    /// 固定的右端小于自然右端时按自然右端（调用方负责在数据写满时重新固定）。
+    /// </param>
+    /// <param name="xMin">计算得到的 X 轴最小值。</param>
+    /// <param name="xMax">计算得到的 X 轴最大值。</param>
+    /// <returns>手动模式返回 false（不修改坐标轴），其余情况返回 true。</returns>
+    public static bool TryCalculateXWindow(
+        ScrollingMode mode,
+        ReadOnlySpan<SeriesXExtent> series,
+        XAxisUnit unit,
+        ScrollingAxisOptions options,
+        double xOffset,
+        double stackedOriginX,
+        double stackedRightX,
+        out double xMin,
         out double xMax)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -85,7 +113,11 @@ public static class ScrollingAxisCalculator
                     // 原点由调用方固定（设置百分比那一刻换算一次，之后不再随数据刷新移动）；
                     // 右端始终为“最新 X 的最大值 + 2 个最大的数据点宽度”（点数单位即“数据点数量 + 2”），因此曲线从固定原点向右堆叠。
                     // 用户拖动后（需求 6）只保持 X 轴最小值，最大值仍为右端。
+                    // 显示百分比大于 100 时右端固定在预留空白处（分阶段扩展），直到数据写满
                     xMax = CalculateStackedRightEdge(series, options);
+                    if (double.IsFinite(stackedRightX) && stackedRightX > xMax)
+                        xMax = stackedRightX;
+
                     xMin = stackedOriginX + xOffset;
                     break;
 
@@ -143,15 +175,36 @@ public static class ScrollingAxisCalculator
         CalculateStackedOrigin(SamplesExtent(count), options, displayPercent);
 
     /// <summary>
-    /// 把“X 轴显示长度百分比”换算成堆叠模式固定的原点位置（多条曲线、任意单位）：原点 = 右端 ×（1 − 百分比）。
+    /// 把“X 轴显示长度百分比”换算成堆叠模式固定的原点位置（多条曲线、任意单位）：原点 = 右端 ×（1 − 百分比）；
+    /// 百分比不小于 100 时原点为 0（显示全部数据，大于 100 的部分作为右侧空白，见 <see cref="CalculateStackedRightLimit"/>）。
     /// </summary>
     /// <param name="series">执行换算时参与计算的曲线。</param>
     /// <param name="options">取值范围参数。</param>
-    /// <param name="displayPercent">显示长度百分比（1 ~ 100，100 = 从 0 开始显示全部数据）。</param>
+    /// <param name="displayPercent">显示长度百分比（1 ~ 1000，100 = 从 0 开始显示全部数据）。</param>
     public static double CalculateStackedOrigin(ReadOnlySpan<SeriesXExtent> series, ScrollingAxisOptions options, double displayPercent)
     {
+        double percent = ScrollingAxisOptions.ClampDisplayPercent(displayPercent);
+        if (percent >= 100.0)
+            return 0.0;
+
         double right = CalculateStackedRightEdge(series, options);
-        return right * (1.0 - (ScrollingAxisOptions.ClampDisplayPercent(displayPercent) / 100.0));
+        return right * (1.0 - (percent / 100.0));
+    }
+
+    /// <summary>
+    /// 堆叠模式显示百分比大于 100 时固定的右端：（最新 X 的最大值 + 留白）× 百分比（点数单位即“（点数 + 2）× 百分比”）。
+    /// 右侧预留空白，坐标轴在数据写满之前保持不动；百分比不大于 100 时返回 NaN（右端不固定）。
+    /// </summary>
+    /// <param name="series">执行换算时参与计算的曲线。</param>
+    /// <param name="options">取值范围参数。</param>
+    /// <param name="displayPercent">显示长度百分比。</param>
+    public static double CalculateStackedRightLimit(ReadOnlySpan<SeriesXExtent> series, ScrollingAxisOptions options, double displayPercent)
+    {
+        double percent = ScrollingAxisOptions.ClampDisplayPercent(displayPercent);
+        if (percent <= 100.0 || series.IsEmpty)
+            return double.NaN;
+
+        return CalculateStackedRightEdge(series, options) * (percent / 100.0);
     }
 
     /// <summary>

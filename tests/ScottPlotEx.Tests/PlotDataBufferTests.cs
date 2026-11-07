@@ -17,18 +17,27 @@ public class PlotDataBufferTests
         Assert.Equal(-3, buffer.LatestValue);
     }
 
-    [Fact(DisplayName = "缓冲区：忽略 NaN 与 Infinity")]
-    public void Add_IgnoresNonFiniteValues()
+    [Fact(DisplayName = "缓冲区：NaN、Infinity、绝对值超过 1e300 的值按缺失值占位（X 不错位），取值范围跳过它们")]
+    public void Add_KeepsMissingValuesAsPlaceholders()
     {
         PlotDataBuffer buffer = new();
 
-        Assert.False(buffer.Add(double.NaN));
-        Assert.False(buffer.Add(double.PositiveInfinity));
-        Assert.False(buffer.Add(double.NegativeInfinity));
+        Assert.True(buffer.Add(double.NaN));
+        Assert.True(buffer.Add(double.PositiveInfinity));
+        Assert.True(buffer.Add(double.NegativeInfinity));
+        Assert.True(buffer.Add(1e301));
         Assert.True(buffer.Add(1));
 
-        Assert.Equal(1, buffer.Count);
-        Assert.Equal(3, buffer.SkippedCount);
+        Assert.Equal(5, buffer.Count);
+        Assert.Equal(4, buffer.SkippedCount);
+        Assert.Equal(1, buffer.FiniteCount);
+        Assert.Equal(5, buffer.LatestX); // 第 5 个点 X = 5：缺失值占了前 4 个位置
+        Assert.All(buffer.Values.Take(4), value => Assert.True(double.IsNaN(value)));
+
+        Assert.True(buffer.TryGetValueRange(out double min, out double max));
+        Assert.Equal(1, min);
+        Assert.Equal(1, max);
+        Assert.False(buffer.TryGetValueRange(1, 4, out _, out _)); // X 1~4 全是缺失值
     }
 
     [Fact(DisplayName = "缓冲区：全部数据的取值范围")]

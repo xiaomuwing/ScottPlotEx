@@ -89,14 +89,24 @@ public class CrossThreadIngestTests
         writer.Start();
         Assert.True(writer.Join(WaitTimeout), "采集线程未能按时结束。");
 
+        // 每 10 批写入的 NaN 按缺失值占一个位置，顺序与写入顺序一致
+        List<double> expected = [];
+        for (int batch = 0; batch < 50; batch++)
+        {
+            expected.AddRange(Enumerable.Range(batch * 100, 100).Select(i => (double)i));
+
+            if (batch % 10 == 0)
+                expected.Add(double.NaN);
+        }
+
         WaitUntil(
             host,
-            () => plot.DataCount == 5_000 && plot.LatestValue == 4_999,
+            () => plot.DataCount == expected.Count && plot.LatestValue == 4_999,
             () => $"数据未按预期到达：DataCount = {host.Invoke(() => plot.DataCount)}");
 
         host.Invoke(() =>
         {
-            Assert.Equal(Enumerable.Range(0, 5_000).Select(i => (double)i), plot.Values);
+            Assert.Equal(expected, plot.Values);
             Assert.Equal(5, plot.SkippedValueCount);
         });
 

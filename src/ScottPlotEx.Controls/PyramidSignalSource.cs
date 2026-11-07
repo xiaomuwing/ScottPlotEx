@@ -23,6 +23,7 @@ namespace ScottPlotEx.Controls;
 /// </summary>
 internal sealed class PyramidSignalSource : SignalSourceBase, ISignalSource, IDataSource
 {
+    private readonly PlotDataBuffer _buffer;
     private readonly List<double> _ys;
     private readonly MinMaxPyramid _pyramid;
 
@@ -31,10 +32,14 @@ internal sealed class PyramidSignalSource : SignalSourceBase, ISignalSource, IDa
     {
         ArgumentNullException.ThrowIfNull(buffer);
 
+        _buffer = buffer;
         _ys = buffer.RawValues;
         _pyramid = buffer.Pyramid;
         Period = period;
     }
+
+    /// <summary>数据所在的缓冲区（断线绘制据此查找缺失区间）。</summary>
+    internal PlotDataBuffer Buffer => _buffer;
 
     /// <inheritdoc />
     public override int Length => _ys.Count;
@@ -76,11 +81,24 @@ internal sealed class PyramidSignalSource : SignalSourceBase, ISignalSource, IDa
         int i1 = GetIndex(xRangeMin, true);
         int i2 = GetIndex(xRangeMax, true);
 
-        float yEnter = axes.GetPixelY((_ys[i1] * YScale) + YOffset);
-        float yExit = axes.GetPixelY((_ys[i2] * YScale) + YOffset);
-
-        // 内置数据源在这里逐点扫描 [i1, i2]；金字塔查询与列宽（每列点数）无关
+        // 内置数据源在这里逐点扫描 [i1, i2]；金字塔查询与列宽（每列点数）无关，并跳过缺失值
         _pyramid.Query(i1, i2 + 1, out double yMin, out double yMax);
+
+        // 这一列全是缺失值：没有可画的数据（断线绘制会在缺失处分段，这里只是兜底）
+        if (!(yMin <= yMax))
+            return PixelColumn.WithoutData(xPixel);
+
+        // 进入 / 离开这一列的点是缺失值时，改用列内第一个 / 最后一个有效点（列内必有有效点）
+        double enter = _ys[i1];
+        if (double.IsNaN(enter))
+            enter = _ys[_buffer.NextFiniteIndex(i1)];
+
+        double exit = _ys[i2];
+        if (double.IsNaN(exit))
+            exit = _ys[_buffer.PreviousFiniteIndex(i2)];
+
+        float yEnter = axes.GetPixelY((enter * YScale) + YOffset);
+        float yExit = axes.GetPixelY((exit * YScale) + YOffset);
         float yBottom = axes.GetPixelY((yMin * YScale) + YOffset);
         float yTop = axes.GetPixelY((yMax * YScale) + YOffset);
 
@@ -91,7 +109,13 @@ internal sealed class PyramidSignalSource : SignalSourceBase, ISignalSource, IDa
 
     bool IDataSource.PreferCoordinates => false;
 
-    int IDataSource.GetXClosestIndex(Coordinates mouseLocation) => GetIndex(mouseLocation.X, true);
+    /// <summary>离鼠标 X 最近的数据点；落在缺失值上时取最近的有效数据点（游标不会停在缺失处）。</summary>
+    int IDataSource.GetXClosestIndex(Coordinates mouseLocation)
+    {
+        int index = GetIndex(mouseLocation.X, true);
+        int finite = _buffer.NearestFiniteIndex(index);
+        return finite >= 0 ? finite : index;
+    }
 
     Coordinates IDataSource.GetCoordinate(int index) => new(GetX(index), _ys[index]);
 

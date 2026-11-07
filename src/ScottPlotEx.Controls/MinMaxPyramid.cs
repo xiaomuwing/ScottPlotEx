@@ -38,10 +38,14 @@ internal sealed class MinMaxPyramid
         }
     }
 
-    /// <summary>原始数据追加了一个点（必须在 <c>raw.Add(y)</c> 之后调用）。</summary>
+    /// <summary>
+    /// 原始数据追加了一个点（必须在 <c>raw.Add(y)</c> 之后调用）。
+    /// 缺失值（NaN）不参与极值：新块以 min = +∞、max = −∞ 起始，等第一个有效值到来时再更新。
+    /// </summary>
     public void OnAppended(double y)
     {
         int index = _raw.Count - 1;
+        bool missing = double.IsNaN(y);
 
         for (int level = 0; level < Levels; level++)
         {
@@ -52,10 +56,14 @@ internal sealed class MinMaxPyramid
             if (block == min.Count)
             {
                 // 新块：更高级的块可能也需要新建或更新，继续向上
-                min.Add(y);
-                max.Add(y);
+                min.Add(missing ? double.PositiveInfinity : y);
+                max.Add(missing ? double.NegativeInfinity : y);
                 continue;
             }
+
+            // 缺失值不改变已有块的极值，更高级的块也不会变
+            if (missing)
+                break;
 
             Span<double> minSpan = CollectionsMarshal.AsSpan(min);
             Span<double> maxSpan = CollectionsMarshal.AsSpan(max);
@@ -90,8 +98,9 @@ internal sealed class MinMaxPyramid
     }
 
     /// <summary>
-    /// 查询原始下标区间 [<paramref name="start"/>, <paramref name="endExclusive"/>) 的极值。
+    /// 查询原始下标区间 [<paramref name="start"/>, <paramref name="endExclusive"/>) 的极值（跳过缺失值 NaN）。
     /// 区间会被裁剪到现有数据范围内；裁剪后为空时返回 false，此时 min = +∞、max = −∞。
+    /// 区间不为空但全是缺失值时返回 true，同样 min = +∞、max = −∞（调用方用 min ≤ max 判断是否有有效数据）。
     /// </summary>
     public bool Query(int start, int endExclusive, out double min, out double max)
     {

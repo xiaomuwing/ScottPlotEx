@@ -43,6 +43,8 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <summary>创建画布（含默认 Plot、Multiplot 与输入处理器）。</summary>
     public PlotCanvas()
     {
+        _invalidateAction = () => Invalidate();
+
         // 每帧都由 SkiaSharp 画满整个客户区：不擦除背景；DIB 本身就是后台缓冲，不需要 WinForms 双缓冲
         SetStyle(ControlStyles.Opaque | ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint, true);
         SetStyle(ControlStyles.OptimizedDoubleBuffer, false);
@@ -95,6 +97,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
         {
             _displayScale = float.IsFinite(value) && value > 0 ? value : 1f;
             Plot.ScaleFactor = _displayScale;
+            _frameDirty = true;
         }
     }
 
@@ -141,6 +144,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
         Plot.ScaleFactor = _displayScale;
         UserInputProcessor.Reset();
         Multiplot.Reset(plot);
+        _frameDirty = true;
     }
 
     /// <inheritdoc />
@@ -160,9 +164,27 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// </summary>
     internal void RequestRepaint()
     {
-        if (Interlocked.Exchange(ref _repaintRequested, 1) == 0)
+        if (Interlocked.Exchange(ref _repaintRequested, 1) != 0)
+            return;
+
+        if (!InvokeRequired)
+        {
             Invalidate();
+            return;
+        }
+
+        // 其它线程上请求重绘：排队到 UI 线程再使画布失效（不在其它线程上访问窗口句柄）
+        try
+        {
+            BeginInvoke(_invalidateAction);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            Interlocked.Exchange(ref _repaintRequested, 0);
+        }
     }
+
+    private readonly Action _invalidateAction;
 
     /// <summary>
     /// 绘制与鼠标 / 键盘输入处理之前调用：所属控件在这里完成合并中的坐标轴更新
@@ -190,17 +212,27 @@ internal sealed class PlotCanvas : Control, IPlotControl
         {
             try
             {
+                // 画面内容没变（没有 Invalidate，只是窗口被遮挡后重新露出、菜单关闭等）且尺寸不变：
+                // 直接把上一帧的 DIB 拷到窗口，不重新渲染（P2）
+                bool reuseFrame = !_frameDirty && _surface is not null && size == _surfaceSize;
                 SKSurface surface = EnsureSurface(size);
-                bool singlePass = SinglePassRendering && IsSinglePlot() && Plot.RenderManager.EnableRendering;
 
-                RenderFrame(surface, singlePass);
+                if (!reuseFrame)
+                {
+                    // 先清标志：渲染过程中再次失效（AxisLimitsChanged 处理器等）会重新置位，下一帧照常渲染
+                    _frameDirty = false;
+                    bool singlePass = SinglePassRendering && IsSinglePlot() && Plot.RenderManager.EnableRendering;
 
-                // 第一遍渲染时 AxisLimitsChanged 的处理器（联动坐标轴、用户代码）又改动了坐标轴：
-                // 按 ScottPlot 原本的方式再渲染，直到坐标轴稳定，保证画面反映最终范围
-                if (singlePass && AxisLimitsChangedSinceLastRender(Plot))
-                    RenderFrame(surface, singlePass: false);
+                    RenderFrame(surface, singlePass);
 
-                surface.Canvas.Flush();
+                    // 第一遍渲染时 AxisLimitsChanged 的处理器（联动坐标轴、用户代码）又改动了坐标轴：
+                    // 按 ScottPlot 原本的方式再渲染，直到坐标轴稳定，保证画面反映最终范围
+                    if (singlePass && AxisLimitsChangedSinceLastRender(Plot))
+                        RenderFrame(surface, singlePass: false);
+
+                    surface.Canvas.Flush();
+                    RenderedFrameCount++;
+                }
 
                 IntPtr hdc = e.Graphics.GetHdc();
                 try
@@ -219,10 +251,55 @@ internal sealed class PlotCanvas : Control, IPlotControl
                 ReleaseSurface();
                 DrawRenderFallback(e.Graphics);
             }
+            catch (Exception exception)
+            {
+                // 渲染失败（用户图元抛出异常、ScottPlot 遇到极端数据等）：不让异常冒到消息循环造成程序退出（需求 8），
+                // 画出错误提示，下一次重绘再试
+                RenderFailureCount++;
+                LastRenderError = exception;
+                _frameDirty = true;
+                System.Diagnostics.Trace.TraceError("ScrollingPlotControl 渲染失败：{0}", exception);
+                DrawRenderError(e.Graphics, exception);
+            }
         }
 
         // 最后再触发 Paint 事件：订阅方画在曲线之上
         base.OnPaint(e);
+    }
+
+    /// <summary>
+    /// 画面是否需要重新渲染。<see cref="Control.Invalidate()"/>（含 <see cref="Control.Refresh"/>、<see cref="RequestRepaint"/>）、
+    /// 尺寸或缩放比例变化、替换 Plot 时置位；窗口被遮挡后重新露出这类系统发起的重绘不置位，直接复用上一帧。
+    /// 直接修改 Plot 之后需要像使用 FormsPlot 一样调用 Refresh / RequestRender 才会显示。
+    /// </summary>
+    private bool _frameDirty = true;
+
+    /// <summary>实际渲染的帧数（复用上一帧的重绘不计入；诊断 / 测试用）。</summary>
+    internal int RenderedFrameCount { get; private set; }
+
+    /// <inheritdoc />
+    protected override void OnInvalidated(InvalidateEventArgs e)
+    {
+        _frameDirty = true;
+        base.OnInvalidated(e);
+    }
+
+    /// <summary>渲染失败的次数（诊断 / 测试用）。</summary>
+    internal int RenderFailureCount { get; private set; }
+
+    /// <summary>最近一次渲染失败的异常（诊断 / 测试用）。</summary>
+    internal Exception? LastRenderError { get; private set; }
+
+    private void DrawRenderError(Graphics graphics, Exception exception)
+    {
+        graphics.Clear(BackColor);
+        TextRenderer.DrawText(
+            graphics,
+            "曲线绘制失败：" + exception.Message,
+            Font,
+            ClientRectangle,
+            SystemColors.GrayText,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
     }
 
     private void DrawRenderFallback(Graphics graphics)

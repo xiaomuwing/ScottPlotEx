@@ -4,6 +4,7 @@ using ScottPlot.WinForms;
 using SkiaSharp;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using PlotCursor = ScottPlot.Cursor;
@@ -92,6 +93,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 因此曲线是“从固定原点向右堆叠”，而不是像跟随模式那样跟着最新数据滑动。
     /// </summary>
     private double _stackedOriginX;
+
+    /// <summary>
+    /// 堆叠显示百分比大于 100 时固定的右端（右侧预留空白，分阶段扩展）：设置百分比时固定一次，
+    /// 数据写到右端（右侧留白不足 2 个点）时再按同一比例扩展。百分比不大于 100 时为 NaN（右端 = 点数 + 2，随数据前进）。
+    /// </summary>
+    private double _stackedRightX = double.NaN;
     private double _xOffset;
     private bool _applyingLimits;
 
@@ -109,6 +116,21 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private bool _gestureMoved;
     private AxisLimits? _limitsAtGestureStart;
     private AxisLimits? _lastKnownLimits;
+
+    /// <summary>
+    /// 按下鼠标时的最新数据 X（各可见曲线最新 X 的最大值；没有数据时为 NaN）。
+    /// 手势期间坐标轴暂停、新数据照常写入，松开时用它判断“能否看到最新数据”：
+    /// 手势期间到达的数据不参与判断，否则数据持续到达时几乎任何拖动都会被判定为看不到最新数据而停止滚动。
+    /// </summary>
+    private double _latestXAtGestureStart = double.NaN;
+
+    /// <summary>
+    /// Y 轴锁定：自动滚动期间用户在 Y 方向调整过视图（拖动、框选、方向键）后，Y 保持用户的范围，X 继续自动滚动。
+    /// 整体显示、重新选择模式、清空数据、Reset、<see cref="ResetYAxis"/> 时解除。
+    /// </summary>
+    private bool _yLocked;
+    private double _lockedYMin;
+    private double _lockedYMax;
 
     /// <summary>
     /// 排队中的合并写入在这么久之后仍未完成（控件不可见、渲染被关闭等情况下等不到渲染完成通知），
@@ -130,8 +152,20 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private bool _flushAwaitingRender;
 
     // 帧率上限（只限制跨线程写入触发的合并重绘）：两次合并写入之间至少间隔这么多 Stopwatch 刻度，0 表示不限制
-    private int _maxFramesPerSecond;
-    private long _minFlushIntervalTicks;
+    private int _maxFramesPerSecond = DefaultMaxFramesPerSecond;
+    private long _minFlushIntervalTicks = Stopwatch.Frequency / DefaultMaxFramesPerSecond;
+
+    /// <summary>
+    /// 空闲保护：上一帧画完后，下一次合并写入不早于这个时刻（Stopwatch 时间戳；0 表示没有限制）。
+    /// 由 UI 线程写、采集线程读（见 <see cref="MaxFramesPerSecond"/>）。
+    /// </summary>
+    private long _idleUntil;
+
+    /// <summary>最近一次合并写入开始的时刻（Stopwatch 时间戳，只在 UI 线程上访问），用于计算一帧的耗时。</summary>
+    private long _flushStartedAt;
+
+    /// <summary>每帧之后至少留出的空闲时间（2 ms）。</summary>
+    private static readonly long MinIdleGapTicks = Stopwatch.Frequency / 500;
 
     /// <summary>
     /// 帧率上限的时间表：最近一次合并写入对应的“帧时刻”（Stopwatch 时间戳）。下一帧 = 本帧时刻 + 间隔，
@@ -240,6 +274,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             _canvas.MouseUp += OnPlotMouseUp;
             _canvas.MouseWheel += OnPlotMouseWheel;
 
+            // 键盘（方向键平移、Ctrl + 方向键缩放、A 键自动缩放）同样只观察：ScottPlot 处理完按键后再判断视图变化。
+            // 方向键只进入 PreviewKeyDown，字母键两者都会进入（第二次时视图已不再变化，不会重复处理）
+            _canvas.PreviewKeyDown += OnPlotPreviewKeyDown;
+            _canvas.KeyDown += OnPlotKeyDown;
+
             ApplyDefaultFont();
             AttachDataToCurrentPlot();
 
@@ -324,6 +363,22 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </summary>
     private bool IsOnUiThread =>
         IsHandleCreated ? !InvokeRequired : Environment.CurrentManagedThreadId == _uiThreadId;
+
+    /// <summary>
+    /// 控件自身的配置接口（模式、百分比、X 轴单位、Reset 等）只能在 UI 线程上调用：它们直接修改 Plot 与坐标轴，
+    /// 在其它线程上执行会与渲染并发。这里在其它线程调用时立即抛出异常，而不是悄悄地并发修改。
+    /// 数据接口与 <see cref="PlotSeries"/> 的属性可以在任意线程调用，不受此限制。
+    /// </summary>
+    private void ThrowIfNotUiThread([CallerMemberName] string member = "")
+    {
+        // 已释放的控件：句柄已销毁，修改不会再与渲染并发（与数据接口一样，释放后调用不抛异常）
+        if (_designerFallback || IsDisposed || Disposing || IsOnUiThread)
+            return;
+
+        throw new InvalidOperationException(
+            $"{member} 只能在创建控件的 UI 线程上调用，请用 Invoke / BeginInvoke 切换到 UI 线程。" +
+            "数据接口（AddValue / AddValues / ClearData / AddSeries）与 PlotSeries 的属性可以在任意线程调用。");
+    }
 
     /// <summary>
     /// 句柄创建后：在 UI 线程上执行句柄创建前排队的界面操作、挂接排队添加的曲线，
@@ -488,7 +543,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     public ScrollingMode Mode
     {
         get => _mode;
-        set => SetMode(value, ScrollingModeChangeReason.UserRequested);
+        set
+        {
+            ThrowIfNotUiThread();
+            SetMode(value, ScrollingModeChangeReason.UserRequested);
+        }
     }
 
     /// <summary>当前是否已停止滚动（手动模式）。</summary>
@@ -517,6 +576,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <exception cref="ArgumentException">参数无效时抛出（例如空视图的最大值不大于最小值、留白为负，见 <see cref="ScrollingAxisOptions.Validate"/>）。</exception>
     public void ApplyAxisOptions()
     {
+        ThrowIfNotUiThread();
         _axisOptions.Validate();
         _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(_axisOptions.StackedDisplayPercent);
         _axisOptions.FollowWindowPercent = ScrollingAxisOptions.ClampWindowPercent(_axisOptions.FollowWindowPercent);
@@ -563,18 +623,20 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 设置指定模式的 X 轴显示长度百分比，并立即按该模式重算坐标轴。
     /// 两种模式的百分比方向一致：**数值越大，看到的数据越多**。
     /// <list type="bullet">
-    /// <item>堆叠模式：显示最新“百分比”的数据（默认 100% 即显示全部数据；90% 只裁掉最早的 10%，不会退化成跟随模式的窄窗口）。</item>
+    /// <item>堆叠模式：显示最新“百分比”的数据（默认 100% 即显示全部数据；90% 只裁掉最早的 10%，不会退化成跟随模式的窄窗口）；大于 100% 时显示全部数据并在右侧预留空白（例如 240% 时曲线约占左侧 42%），数据写满后再按同一比例扩展。</item>
     /// <item>跟随模式：显示最后“百分比”的数据窗口（默认 30%，最小 0.1% 且至少 2 个数据点宽）。</item>
     /// </list>
     /// 明确指定 <paramref name="mode"/> 可以避免“把跟随模式的窗口百分比误写到堆叠模式”这类问题。
     /// </summary>
-    /// <param name="percent">百分比（越界值自动限制：堆叠 1 ~ 100，跟随 0.1 ~ 100）。</param>
+    /// <param name="percent">百分比（越界值自动限制：堆叠 1 ~ 1000，跟随 0.1 ~ 100）。</param>
     /// <param name="mode">
     /// 明确指定要修改哪个模式的显示长度（手动模式会落到暂停之前的模式）。
     /// 该参数是必填的：把“读出来的百分比再写回去”这种写法固定成显式操作，避免误改另一个模式。
     /// </param>
     public void SetXAxisDisplayPercent(double percent, ScrollingMode mode)
     {
+        ThrowIfNotUiThread();
+
         if (ResolvePercentMode(mode) == ScrollingMode.Follow)
         {
             _axisOptions.FollowWindowPercent = ScrollingAxisOptions.ClampWindowPercent(percent);
@@ -597,17 +659,18 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     public void ShowAllData() => SetXAxisDisplayPercent(100.0, ScrollingMode.Stacked);
 
     /// <summary>
-    /// 堆叠模式的 X 轴显示长度百分比（1 ~ 100）。默认 100，即从 0 开始显示全部数据；
-    /// 数值越大看到的数据越多（90 只裁掉最早的 10%）。
+    /// 堆叠模式的 X 轴显示长度百分比（1 ~ 1000）。默认 100，即从 0 开始显示全部数据；
+    /// 数值越大看到的数据越多（90 只裁掉最早的 10%）；大于 100 时在右侧预留空白、分阶段扩展（见 <see cref="ScrollingAxisOptions.StackedDisplayPercent"/>）。
     /// </summary>
     [Category("ScottPlotEx")]
     [DefaultValue(100.0)]
-    [Description("堆叠模式显示长度百分比：显示最新该百分比的数据（100 = 显示全部数据）。")]
+    [Description("堆叠模式显示长度百分比：显示最新该百分比的数据（100 = 显示全部数据；大于 100 时右侧预留空白、分阶段扩展）。")]
     public double StackedDisplayPercent
     {
         get => _axisOptions.StackedDisplayPercent;
         set
         {
+            ThrowIfNotUiThread();
             _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(value);
             PinStackedOrigin();
             ReapplyAxes();
@@ -622,9 +685,34 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private void PinStackedOrigin()
     {
         ReadOnlySpan<SeriesXExtent> extents = VisibleExtents();
+        double percent = _axisOptions.StackedDisplayPercent;
+
         _stackedOriginX = extents.IsEmpty
             ? 0.0
-            : ScrollingAxisCalculator.CalculateStackedOrigin(extents, _axisOptions, _axisOptions.StackedDisplayPercent);
+            : ScrollingAxisCalculator.CalculateStackedOrigin(extents, _axisOptions, percent);
+
+        // 百分比大于 100：同时固定右端（右侧预留空白）；没有数据时等第一批数据到达再固定（见 ExtendStackedRightLimit）
+        _stackedRightX = ScrollingAxisCalculator.CalculateStackedRightLimit(extents, _axisOptions, percent);
+    }
+
+    /// <summary>
+    /// 堆叠显示百分比大于 100 时的分阶段扩展：还没有固定右端、或数据已写到固定的右端（右侧留白不足 2 个点）时，
+    /// 按同一比例重新固定右端。只在自动滚动计算时调用（手势期间、手动模式下不扩展）。
+    /// </summary>
+    private void ExtendStackedRightLimit(ReadOnlySpan<SeriesXExtent> extents)
+    {
+        double percent = ScrollingAxisOptions.ClampDisplayPercent(_axisOptions.StackedDisplayPercent);
+
+        if (percent <= 100.0)
+        {
+            _stackedRightX = double.NaN;
+            return;
+        }
+
+        double natural = ScrollingAxisCalculator.CalculateStackedRightEdge(extents, _axisOptions);
+
+        if (!double.IsFinite(_stackedRightX) || natural > _stackedRightX)
+            _stackedRightX = ScrollingAxisCalculator.CalculateStackedRightLimit(extents, _axisOptions, percent);
     }
 
     /// <summary>当前固定的堆叠原点位置（可读取用于诊断）。</summary>
@@ -641,6 +729,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _axisOptions.FollowWindowPercent;
         set
         {
+            ThrowIfNotUiThread();
             _axisOptions.FollowWindowPercent = ScrollingAxisOptions.ClampWindowPercent(value);
             ReapplyAxes();
         }
@@ -660,6 +749,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _axisOptions.FollowWindowPoints;
         set
         {
+            ThrowIfNotUiThread();
             _axisOptions.FollowWindowPoints = Math.Max(0, value);
             ReapplyAxes();
         }
@@ -679,6 +769,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _axisOptions.FollowWindowDuration;
         set
         {
+            ThrowIfNotUiThread();
             _axisOptions.FollowWindowDuration = value > TimeSpan.Zero ? value : TimeSpan.Zero;
             ReapplyAxes();
         }
@@ -706,7 +797,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     public XAxisUnit XAxisUnit
     {
         get => _xAxisUnit;
-        set => SetXAxisUnit(value);
+        set
+        {
+            ThrowIfNotUiThread();
+            SetXAxisUnit(value);
+        }
     }
 
     /// <summary>
@@ -722,6 +817,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _defaultSampleInterval;
         set
         {
+            ThrowIfNotUiThread();
+
             if (value <= TimeSpan.Zero)
                 throw new ArgumentOutOfRangeException(nameof(value), value, "采样间隔必须大于 0。");
 
@@ -751,6 +848,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 return;
             }
 
+            ThrowIfNotUiThread();
+
             if (value is null && _xAxisUnit == XAxisUnit.AbsoluteTime)
                 EnsureAbsoluteStartTimes(defaultStartTime: null);
 
@@ -770,15 +869,21 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>默认采样间隔（秒）。</summary>
     internal double DefaultSampleIntervalSeconds => _defaultSampleIntervalSeconds;
 
+    /// <summary>帧率上限的默认值（帧/秒）。</summary>
+    public const int DefaultMaxFramesPerSecond = 60;
+
     /// <summary>
-    /// 跨线程写入触发的重绘帧率上限（帧/秒）。默认 0，即不限制（每帧画完立即处理下一批数据）。
-    /// 设为 30 / 60 等值后，两次合并写入之间至少间隔一帧时间，数据照常全部接收（只是按帧合并），CPU 占用随之下降。
-    /// 间隔由高精度定时器控制，不受 WinForms 定时器约 15.6 ms 精度的影响（33 ms 不会被拉长到约 47 ms）。
-    /// UI 线程上的写入仍然同步生效、由消息循环合并重绘，不受此限制。
+    /// 跨线程写入触发的重绘帧率上限（帧/秒）。默认 60；设为 0 表示不限制（每帧画完立即处理下一批数据）。
+    /// 两次合并写入之间至少间隔一帧时间，数据照常全部接收（只是按帧合并）。间隔由高精度定时器（独立线程，约 1 ms 精度）控制，
+    /// 不受 WinForms 定时器约 15.6 ms 精度的影响（60 帧就是 16.7 ms 一帧）。
+    /// 设置了上限时，每帧画完后还会至少留出“这一帧耗时的 20%，最少 2 ms”的空闲再处理下一批：
+    /// 窗口消息队列在这段时间里是空的，应用自己的 WinForms 定时器（WM_TIMER，优先级最低，只在队列空闲时触发）才能运行；
+    /// 否则一帧耗时超过帧间隔时（曲线很多、窗口很大），“合并写入 → 绘制”首尾相接，窗体上的定时器会完全停摆。
+    /// 设为 0 时不做这项保护。UI 线程上的写入仍然同步生效、由消息循环合并重绘，不受此限制。
     /// </summary>
     [Category("ScottPlotEx")]
-    [DefaultValue(0)]
-    [Description("跨线程写入触发的重绘帧率上限（帧/秒），0 表示不限制。")]
+    [DefaultValue(DefaultMaxFramesPerSecond)]
+    [Description("跨线程写入触发的重绘帧率上限（帧/秒），默认 60，0 表示不限制。")]
     public int MaxFramesPerSecond
     {
         get => _maxFramesPerSecond;
@@ -789,15 +894,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
             // 帧率变化：时间表从下一次合并写入重新对齐
             Interlocked.Exchange(ref _frameSlot, 0);
+            Interlocked.Exchange(ref _idleUntil, 0);
 
             if (_designerFallback)
                 return;
 
             if (_maxFramesPerSecond > 0)
             {
-                if (_frameTimer is null && !IsDisposed && !DesignMode)
-                    _frameTimer = new HighResolutionTimer(OnFrameTimerDue);
-
+                EnsureFrameTimer();
                 return;
             }
 
@@ -853,7 +957,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 得到的就是按当前数据计算的自动滚动范围。没有待更新的内容时什么也不做。
     /// 绘制、鼠标 / 键盘输入以及控件内部读取坐标轴之前会自动调用，通常不需要手动调用；
     /// 在写入数据的同一段代码里读取坐标轴范围、或直接用 <c>Plot</c> 导出图像之前调用即可。
-    /// 可以在任意线程调用（非 UI 线程会同步切换到 UI 线程执行）。
+    /// 可以在任意线程调用（非 UI 线程会同步切换到 UI 线程执行、等待完成）；UI 线程正在等待调用线程时
+    /// （例如关闭窗体时 Join 采集线程）不要从该线程调用，否则两边互相等待。
     /// </summary>
     public void UpdateAxesNow()
     {
@@ -875,6 +980,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _showLegend;
         set
         {
+            ThrowIfNotUiThread();
             _showLegend = value;
 
             if (_designerFallback)
@@ -922,6 +1028,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         get => _plotMenu?.ShowModeItems ?? _showModeItemsFallback;
         set
         {
+            ThrowIfNotUiThread();
             _showModeItemsFallback = value;
 
             if (_plotMenu is not null)
@@ -930,7 +1037,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     }
 
     /// <summary>停止滚动（切换到手动模式），保持当前视图。</summary>
-    public void StopScrolling() => SetMode(ScrollingMode.Manual, ScrollingModeChangeReason.UserRequested);
+    public void StopScrolling()
+    {
+        ThrowIfNotUiThread();
+        SetMode(ScrollingMode.Manual, ScrollingModeChangeReason.UserRequested);
+    }
 
     private void SetMode(ScrollingMode mode, ScrollingModeChangeReason reason)
     {
@@ -965,7 +1076,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         _xOffset = 0;
 
         if (mode != ScrollingMode.Manual)
+        {
+            // 进入（或重新选择）自动滚动模式 = 回到该模式的默认视图：解除 Y 锁定（Q2）
+            _yLocked = false;
             ApplyAutoScroll();
+        }
 
         if (previous != mode || reason == ScrollingModeChangeReason.UserRequested)
         {
@@ -998,7 +1113,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public double LatestValue => _defaultSeries?.LatestValue ?? double.NaN;
 
-    /// <summary>默认曲线中被忽略的非有限值数量（NaN / Infinity）。</summary>
+    /// <summary>默认曲线中的缺失值数量（NaN、±Infinity、绝对值超过 1e300；占位保存，绘制时在该处断开）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int SkippedValueCount => _defaultSeries?.SkippedValueCount ?? 0;
@@ -1035,7 +1150,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 可以在任意线程调用：UI 线程上同步生效；非 UI 线程上先进入待处理列表，
     /// 由 UI 线程按帧整批写入（无论调用多频繁，窗口消息队列里最多只有一条合并写入消息）。
     /// </summary>
-    /// <param name="y">Y 值，非有限值会被忽略。</param>
+    /// <param name="y">Y 值；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValue(double y)
     {
         if (_designerFallback)
@@ -1045,7 +1160,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     }
 
     /// <summary>向默认曲线批量添加数据点。</summary>
-    /// <param name="values">Y 值集合，非有限值会被忽略。</param>
+    /// <param name="values">Y 值集合；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValues(IEnumerable<double> values)
     {
         if (_designerFallback)
@@ -1068,7 +1183,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 向默认曲线批量添加数据点。UI 线程上直接写入、不复制调用方的数据；
     /// 非 UI 线程上会先复制到内部待处理列表（调用返回后即可复用传入的缓冲区）。
     /// </summary>
-    /// <param name="values">Y 值，非有限值会被忽略。</param>
+    /// <param name="values">Y 值；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValues(ReadOnlySpan<double> values)
     {
         if (_designerFallback)
@@ -1094,6 +1209,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                     series.PendingValues.Clear();
                     series.PendingClear = true;
                 }
+
+                _pendingClearAll = true;
             }
 
             PostPendingFlush();
@@ -1102,6 +1219,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         // 与后台线程清空保持一致：清空之前排队、还没合并写入的数据一并丢弃，不会在清空之后又出现
         DiscardPendingWrites(only: null);
+        _yLocked = false;
 
         foreach (PlotSeries series in _series)
         {
@@ -1131,8 +1249,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 series.PendingValues.Clear();
                 series.PendingClear = false;
             }
+
+            if (only is null)
+                _pendingClearAll = false;
         }
     }
+
+    /// <summary>其它线程调用了 <see cref="ClearData"/>（清空全部曲线），合并写入时要一并解除 Y 锁定。由待处理锁保护。</summary>
+    private bool _pendingClearAll;
 
     #endregion
 
@@ -1183,17 +1307,15 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         if (!IsOnUiThread)
         {
-            if (IsHandleCreated)
-                return (PlotSeries)Invoke(new Func<PlotSeries>(() => AddSeries(name, color, startTime)));
-
-            // 句柄创建前从其它线程添加：先把曲线加入列表（数据会进入待处理队列），
-            // 挂接 Plot 与重算坐标轴推迟到 OnHandleCreated 的 UI 线程上执行
+            // 其它线程上添加：立即创建曲线并加入列表（之后写入的数据进入待处理队列），
+            // 挂接 Plot 与重算坐标轴排队到 UI 线程（句柄创建前则在 OnHandleCreated 中执行）。
+            // 调用不等待 UI 线程：UI 线程正在等待本线程（例如关闭窗体时 Join 采集线程）也不会互相卡死
             PlotSeries pending = CreateSeries(name, color, startTime);
 
             lock (_pendingLock)
                 _pendingAttach.Add(pending);
 
-            // 与 OnHandleCreated 竞争：句柄可能刚好在判断线程之后创建
+            // 句柄已创建时投递挂接；句柄创建前由 OnHandleCreated 处理（并处理与它的竞争）
             PostPendingAttach();
             return pending;
         }
@@ -1238,9 +1360,57 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     }
 
     /// <summary>
-    /// 在 UI 线程上执行（非 UI 线程同步切换；句柄尚未创建时排入队列，在 <see cref="OnHandleCreated"/> 中执行，
-    /// 避免后台线程直接修改 Plot / 控件状态）。
-    /// 操作本身抛出的异常（例如绝对时间单位下清除起始时间）原样抛给调用方；切换线程时句柄正在销毁则忽略。
+    /// 在 UI 线程上执行，调用不等待：UI 线程上立即执行（异常照常抛给调用方）；其它线程上用 BeginInvoke 排队
+    /// （句柄尚未创建时排入队列，在 <see cref="OnHandleCreated"/> 中执行）。
+    /// 与跨线程数据写入走同一个窗口消息队列，同一线程先后发出的写入与修改按顺序执行。
+    /// 排队执行时的 <see cref="InvalidOperationException"/>（调用线程上已检查过的配置在执行前被别的操作改变）与释放竞态被忽略，
+    /// 不会变成 UI 线程上的未处理异常。
+    /// </summary>
+    internal void PostToUiThread(Action action)
+    {
+        if (IsOnUiThread)
+        {
+            action();
+            return;
+        }
+
+        if (!IsHandleCreated)
+        {
+            lock (_pendingLock)
+                _pendingUiActions.Enqueue(action);
+
+            // 与 OnHandleCreated 竞争：句柄可能刚好在判断线程之后创建
+            PostPendingUiActions();
+            return;
+        }
+
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (IsDisposed || Disposing)
+                    return;
+
+                try
+                {
+                    action();
+                }
+                catch (InvalidOperationException)
+                {
+                    // 例如：调用线程检查时允许清除起始时间，执行前单位被切换到了绝对时间。保持原值即可
+                }
+            });
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            // 句柄正在销毁：修改已无意义
+        }
+    }
+
+    /// <summary>
+    /// 在 UI 线程上执行并等待完成（非 UI 线程同步切换；句柄尚未创建时排入队列，在 <see cref="OnHandleCreated"/> 中执行）。
+    /// 只用于必须拿到结果的接口（<see cref="UpdateAxesNow"/>）：UI 线程正在等待调用线程时会互相卡死，调用方需避免。
+    /// 操作本身抛出的异常原样抛给调用方；切换线程时句柄正在销毁则忽略。
     /// </summary>
     internal void RunOnUiThread(Action action)
     {
@@ -1385,7 +1555,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (series.IsDefault)
             throw new InvalidOperationException("默认曲线不能删除（单曲线接口 AddValue / AddValues 写入的就是它）；不需要时可设置 IsVisible = false。");
 
-        RunOnUiThread(() =>
+        PostToUiThread(() =>
         {
             if (series.IsRemoved || IsDisposed || _designerFallback)
                 return;
@@ -1665,6 +1835,19 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
     }
 
+    /// <summary>
+    /// 在调用线程上检查曲线起始时间的修改是否允许（绝对时间单位下不允许让曲线失去起始时间），不允许时抛给调用方。
+    /// 持有待处理锁读取曲线列表（UI 线程修改列表时同样持锁）。
+    /// </summary>
+    internal void ValidateSeriesStartTime(PlotSeries series, DateTime? value)
+    {
+        if (_designerFallback || value is not null || _xAxisUnit != XAxisUnit.AbsoluteTime || series.IsRemoved)
+            return;
+
+        lock (_pendingLock)
+            EnsureAbsoluteStartTimes(_defaultStartTime, series, changedStartTime: null);
+    }
+
     /// <summary>设置曲线自己的起始时间（UI 线程）：绝对时间单位下不允许让曲线失去起始时间。</summary>
     internal void SetSeriesStartTime(PlotSeries series, DateTime? value)
     {
@@ -1895,6 +2078,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <inheritdoc />
     public override void Refresh()
     {
+        ThrowIfNotUiThread();
+
         if (_designerFallback || _canvas is null || _canvas.IsDisposed)
             return;
 
@@ -1921,6 +2106,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <inheritdoc />
     public void Reset()
     {
+        ThrowIfNotUiThread();
+
         if (_designerFallback || _canvas is null)
             return;
 
@@ -1936,6 +2123,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
 
         _xOffset = 0;
+        _yLocked = false;
         _canvas.Reset();
         _canvas.Plot.DataBackground.Color = Colors.White;
         ApplyDefaultFont();
@@ -1959,12 +2147,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     public void Reset(Plot plot, bool disposeOldPlot)
     {
         ArgumentNullException.ThrowIfNull(plot);
+        ThrowIfNotUiThread();
 
         if (_designerFallback || _canvas is null)
             return;
 
         _canvas.Reset(plot, disposeOldPlot);
         _xOffset = 0;
+        _yLocked = false;
         ApplyDefaultFont();
         AttachDataToCurrentPlot();
         ApplyAutoScroll();
@@ -2011,6 +2201,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// </summary>
     public void ShowHelp()
     {
+        ThrowIfNotUiThread();
+
         HelpRequestedEventArgs args = new(PlotHelpContent.Text);
         ShowHelpRequested?.Invoke(this, args);
 
@@ -2106,7 +2298,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         // 线宽默认 1：SkiaSharp 对不超过 1 个设备像素的线走“发丝线”快速光栅化；
         // 1.5 需要先描边成多边形再做抗锯齿填充，数据密集时单帧耗时约为 1 的 2~4 倍（100 万点 13.8 ms → 3.8 ms）。
         // X 映射（Period / XOffset）由控件按当前单位设置：点数单位 X = 下标 + 1，时间单位见 ApplySeriesXMapping
-        series.Plottable = plot.Add.Signal(new PyramidSignalSource(series.Data, period: 1.0));
+        // 缺失值（NaN 占位）处断开的曲线：ScottPlot 自带的 Signal 遇到 NaN 整条连线都会消失（见 GapAwareSignal）
+        GapAwareSignal signal = new(new PyramidSignalSource(series.Data, period: 1.0));
+        plot.Add.Plottable(signal);
+        series.Plottable = signal;
         ApplySeriesXMapping(series);
         series.ApplyStyle();
     }
@@ -2172,13 +2367,78 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
         }
 
-        if (!ScrollingAxisCalculator.TryCalculateXWindow(_mode, extents, _xAxisUnit, _axisOptions, _xOffset, _stackedOriginX, out double xMin, out double xMax))
+        if (_mode == ScrollingMode.Stacked)
+            ExtendStackedRightLimit(extents);
+
+        if (!ScrollingAxisCalculator.TryCalculateXWindow(_mode, extents, _xAxisUnit, _axisOptions, _xOffset, _stackedOriginX, _stackedRightX, out double xMin, out double xMax))
             return; // 手动模式：不修改坐标轴
 
-        if (!TryCalculateVisibleYRange(xMin, xMax, out double yMin, out double yMax))
+        double yMin;
+        double yMax;
+
+        if (_yLocked)
+        {
+            // 用户调整过 Y：保持用户的范围，只滚动 X
+            yMin = _lockedYMin;
+            yMax = _lockedYMax;
+        }
+        else if (!TryCalculateVisibleYRange(xMin, xMax, out yMin, out yMax))
+        {
             return;
+        }
 
         ApplyLimits(xMin, xMax, yMin, yMax);
+    }
+
+    /// <summary>
+    /// Y 轴是否被锁定：自动滚动期间用户在 Y 方向调整过视图（左键拖动的竖直移动达到 <see cref="DragThresholdPixels"/> 像素、
+    /// 中键框选、方向键 ↑↓）后，Y 保持用户的范围，X 继续自动滚动。
+    /// 整体显示（中键单击 / 菜单“自动缩放” / A 键）、重新选择模式、<see cref="ClearData"/>、<see cref="Reset()"/>、
+    /// <see cref="ResetYAxis"/> 时解除。
+    /// </summary>
+    [Browsable(false)]
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool IsYAxisLocked => _yLocked;
+
+    /// <summary>解除 Y 轴锁定：自动滚动模式下立即按数据重新计算 Y 轴范围。</summary>
+    public void ResetYAxis()
+    {
+        ThrowIfNotUiThread();
+
+        if (!_yLocked || _designerFallback)
+            return;
+
+        _yLocked = false;
+
+        if (_mode != ScrollingMode.Manual)
+            ApplyAutoScroll();
+
+        RememberLimits();
+        RequestRender();
+    }
+
+    /// <summary>
+    /// 继续滚动的操作结束后，判断用户是否调整了 Y：上下边界任一移动达到 <see cref="DragThresholdPixels"/> 像素即锁定为当前范围
+    /// （更小的移动视为横向拖动时手的抖动，不锁定）。
+    /// </summary>
+    private void UpdateYLock(AxisLimits before, AxisLimits after)
+    {
+        double span = before.Top - before.Bottom;
+        if (!double.IsFinite(span) || span == 0)
+            return;
+
+        double heightPixels = _canvas.Plot.RenderManager.LastRender.DataRect.Height;
+        if (!(heightPixels > 0))
+            heightPixels = Math.Max(1, _canvas.ClientSize.Height);
+
+        double movedPixels = Math.Max(Math.Abs(after.Bottom - before.Bottom), Math.Abs(after.Top - before.Top)) / Math.Abs(span) * heightPixels;
+
+        if (movedPixels >= DragThresholdPixels && double.IsFinite(after.Bottom) && double.IsFinite(after.Top) && after.Top != after.Bottom)
+        {
+            _yLocked = true;
+            _lockedYMin = Math.Min(after.Bottom, after.Top);
+            _lockedYMax = Math.Max(after.Bottom, after.Top);
+        }
     }
 
     private bool TryCalculateVisibleYRange(double xMin, double xMax, out double yMin, out double yMax)
@@ -2286,6 +2546,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         _gestureStartPoint = e.Location;
         _gestureMoved = false;
         _limitsAtGestureStart = ReadLimits();
+        _latestXAtGestureStart = LatestVisibleX();
     }
 
     private void OnPlotMouseMove(object? sender, MouseEventArgs e)
@@ -2305,10 +2566,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         MouseButtons button = _gestureButton;
         bool moved = _gestureMoved;
         AxisLimits? limitsBefore = _limitsAtGestureStart;
+        double latestXAtStart = _latestXAtGestureStart;
 
         _gestureButton = MouseButtons.None;
         _gestureMoved = false;
         _limitsAtGestureStart = null;
+        _latestXAtGestureStart = double.NaN;
 
         if (button == MouseButtons.None || button != e.Button)
             return;
@@ -2330,7 +2593,45 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
         }
 
-        HandleViewGesture(gesture, limitsAfter.Value, limitsBefore);
+        // 按下鼠标时的最新数据判断能否看到最新数据（手势期间到达的数据不计入，见 _latestXAtGestureStart）
+        HandleViewGesture(gesture, limitsAfter.Value, limitsBefore, latestXAtStart);
+    }
+
+    private void OnPlotPreviewKeyDown(object? sender, PreviewKeyDownEventArgs e) => HandleKeyboardInput(e.KeyCode);
+
+    private void OnPlotKeyDown(object? sender, KeyEventArgs e) => HandleKeyboardInput(e.KeyCode);
+
+    /// <summary>
+    /// 键盘操作已由 ScottPlot 处理完毕：视图发生变化时按对应的鼠标操作规则处理（M4）。
+    /// A 键 = 整体显示；方向键平移（两个方向的跨度都不变）= 左键拖动；Ctrl + 方向键缩放（跨度改变）= 滚轮缩放。
+    /// </summary>
+    private void HandleKeyboardInput(Keys key)
+    {
+        if (_designerFallback || _canvas is null || IsUserGestureInProgress)
+            return;
+
+        AxisLimits? before = _lastKnownLimits;
+        AxisLimits? after = ReadLimits();
+
+        if (before is null || after is null || !ViewChanged(before.Value, after.Value))
+        {
+            RememberLimits(after);
+            return;
+        }
+
+        PlotViewGesture gesture = key == Keys.A
+            ? PlotViewGesture.Autoscale
+            : SameSpan(before.Value, after.Value) ? PlotViewGesture.KeyboardPan : PlotViewGesture.KeyboardZoom;
+
+        HandleViewGesture(gesture, after.Value, before);
+
+        static bool SameSpan(AxisLimits a, AxisLimits b)
+        {
+            double widthA = a.Right - a.Left;
+            double heightA = a.Top - a.Bottom;
+            return Math.Abs((b.Right - b.Left) - widthA) <= Math.Abs(widthA) * 1e-9
+                && Math.Abs((b.Top - b.Bottom) - heightA) <= Math.Abs(heightA) * 1e-9;
+        }
     }
 
     private void OnPlotMouseWheel(object? sender, MouseEventArgs e)
@@ -2364,9 +2665,16 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     };
 
     /// <summary>根据用户操作调整自动滚动状态（需求 3、6、7）。</summary>
-    private void HandleViewGesture(PlotViewGesture gesture, AxisLimits currentLimits, AxisLimits? fallbackLimits)
+    /// <param name="gesture">完成的操作。</param>
+    /// <param name="currentLimits">操作后的视图。</param>
+    /// <param name="fallbackLimits">操作前的视图（操作产生非法范围时回滚到它；也用于判断 Y 是否被调整）。</param>
+    /// <param name="latestXAtStart">
+    /// 鼠标手势按下时的最新数据 X：判断“能否看到最新数据”时用它代替当前的最新数据（手势期间到达的数据不计入）。
+    /// NaN 表示瞬间完成的操作（滚轮、键盘），按当前最新数据判断。
+    /// </param>
+    private void HandleViewGesture(PlotViewGesture gesture, AxisLimits currentLimits, AxisLimits? fallbackLimits, double latestXAtStart = double.NaN)
     {
-        // 中键单击 / 菜单“自动缩放” = 整体显示，单独处理
+        // 中键单击 / 菜单“自动缩放” / A 键 = 整体显示，单独处理
         if (gesture == PlotViewGesture.Autoscale)
         {
             HandleAutoscaleGesture(currentLimits, fallbackLimits);
@@ -2375,12 +2683,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         if (_mode == ScrollingMode.Manual)
         {
-            // 已经停止滚动：其它鼠标操作保持用户当前视图
+            // 已经停止滚动：其它操作保持用户当前视图
             RestoreLimitsIfInvalid(currentLimits, fallbackLimits);
             return;
         }
 
-        bool latestVisible = IsLatestDataVisible(currentLimits);
+        bool latestVisible = IsLatestDataVisible(currentLimits, latestXAtStart);
         AutoScrollDecision decision = AutoScrollPolicy.Decide(_mode, gesture, latestVisible, _axisOptions);
 
         switch (decision.Action)
@@ -2391,6 +2699,11 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
             case AutoScrollAction.KeepScrollingAtCurrentXMin:
                 _xOffset = CalculateOffsetFromCurrentView(currentLimits);
+
+                // Q2：继续滚动时保留用户在 Y 方向的调整（锁定 Y）
+                if (fallbackLimits is { } before)
+                    UpdateYLock(before, currentLimits);
+
                 break;
 
             case AutoScrollAction.ResetOffset:
@@ -2402,8 +2715,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     }
 
     /// <summary>
-    /// 处理“整体显示”（鼠标中键单击或菜单“自动缩放”）：
-    /// 退出停止滚动状态，并按需切换模式（跟随模式会自动切换为堆叠模式），最后复位 X 轴偏移。
+    /// 处理“整体显示”（鼠标中键单击、菜单“自动缩放”或 A 键）= 显示全部数据：
+    /// 退出停止滚动状态并按需切换模式（跟随模式自动切换为堆叠模式）；堆叠显示百分比一律恢复为 100%（Q1）、
+    /// 复位 X 轴偏移、解除 Y 锁定，并立即按自动滚动规则重算坐标轴（不保留 ScottPlot 自动缩放带边距的范围）。
     /// </summary>
     private void HandleAutoscaleGesture(AxisLimits currentLimits, AxisLimits? fallbackLimits)
     {
@@ -2417,17 +2731,23 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
         }
 
+        _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.DefaultStackedDisplayPercent;
+        _yLocked = false;
+
         ScrollingMode target = AutoScrollPolicy.ResolveAutoscaleMode(_mode, _lastAutoScrollMode, _axisOptions);
 
         if (target != _mode)
         {
-            // 例如：跟随模式 → 堆叠模式（需求补充）
+            // 例如：跟随模式 → 堆叠模式（需求补充 2）、停止滚动 → 恢复（补充 1）；SetMode 会固定原点、复位偏移并立即重算
             SetMode(target, ScrollingModeChangeReason.Autoscale);
             return;
         }
 
         _xOffset = 0;
-        RestoreLimitsIfInvalid(currentLimits, fallbackLimits);
+        PinStackedOrigin();
+        ApplyAutoScroll();
+        RememberLimits();
+        RequestRender();
     }
 
     /// <summary>
@@ -2478,15 +2798,13 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// 判断最新数据点（各可见曲线最后一个点中 X 最大的那个；点数单位即最长曲线的最后一个点）
     /// 是否在当前可见的 X 轴范围内（需求 6、7）。
     /// </summary>
-    private bool IsLatestDataVisible(AxisLimits limits)
+    /// <param name="limits">要判断的视图。</param>
+    /// <param name="latestXOverride">用这个 X 代替当前的最新数据（鼠标手势按下时记录的最新数据）；NaN 表示用当前的。</param>
+    private bool IsLatestDataVisible(AxisLimits limits, double latestXOverride = double.NaN)
     {
-        ReadOnlySpan<SeriesXExtent> extents = VisibleExtents();
-        if (extents.IsEmpty || !limits.IsRealX)
+        double latestX = double.IsFinite(latestXOverride) ? latestXOverride : LatestVisibleX();
+        if (!double.IsFinite(latestX) || !limits.IsRealX)
             return true;
-
-        double latestX = double.NegativeInfinity;
-        foreach (SeriesXExtent extent in extents)
-            latestX = Math.Max(latestX, extent.LatestX);
 
         double xMin = Math.Min(limits.Left, limits.Right);
         double xMax = Math.Max(limits.Left, limits.Right);
@@ -2494,6 +2812,20 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         double tolerance = span > 0 ? span * _axisOptions.LatestVisibilityToleranceFraction : 0;
 
         return latestX >= xMin - tolerance && latestX <= xMax + tolerance;
+    }
+
+    /// <summary>各可见曲线最新数据点 X 的最大值（点数单位即最长可见曲线的点数）；没有可见数据时为 NaN。</summary>
+    private double LatestVisibleX()
+    {
+        double latestX = double.NaN;
+
+        foreach (SeriesXExtent extent in VisibleExtents())
+        {
+            if (!(extent.LatestX <= latestX))
+                latestX = extent.LatestX;
+        }
+
+        return latestX;
     }
 
     /// <summary>供右键菜单“自动缩放”调用：保持当前模式并复位偏移。</summary>
@@ -2573,10 +2905,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (Interlocked.CompareExchange(ref _flushPostedAt, now, postedAt) != postedAt)
             return; // 其它线程抢先投递了
 
-        if (interval > 0 && Volatile.Read(ref _frameTimer) is { } timer)
+        if (interval > 0 && EnsureFrameTimer() is { } timer)
         {
-            // 下一帧时刻 = 本帧时刻 + 间隔（固定网格，见 _frameSlot）
-            long due = Interlocked.Read(ref _frameSlot) + interval;
+            // 下一帧时刻 = 本帧时刻 + 间隔（固定网格，见 _frameSlot），且不早于上一帧之后的空闲保护时刻
+            long due = Math.Max(Interlocked.Read(ref _frameSlot) + interval, Interlocked.Read(ref _idleUntil));
 
             // 定时器在并发中被释放（帧率上限改回 0 / 控件释放）时调度不会生效：直接投递，不能让数据滞留
             if (due > now && timer.Schedule(due))
@@ -2590,6 +2922,36 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
     /// <summary>帧率上限的定时到点（后台线程）：投递这一帧的合并写入。</summary>
     private void OnFrameTimerDue() => BeginInvokeFlush();
+
+    /// <summary>
+    /// 取得帧率上限使用的高精度定时器，第一次需要时才创建（默认帧率上限为 60，但从不跨线程写入的控件不必创建定时线程）。
+    /// 可能在采集线程上调用；控件已释放时返回 null。
+    /// </summary>
+    private HighResolutionTimer? EnsureFrameTimer()
+    {
+        HighResolutionTimer? timer = Volatile.Read(ref _frameTimer);
+        if (timer is not null || IsDisposed || Disposing || _designerFallback || DesignMode)
+            return timer;
+
+        HighResolutionTimer created = new(OnFrameTimerDue);
+
+        if (Interlocked.CompareExchange(ref _frameTimer, created, null) is { } existing)
+        {
+            created.Dispose();
+            return existing;
+        }
+
+        // 创建期间控件被释放：撤销，避免留下定时线程
+        if (IsDisposed || Disposing)
+        {
+            if (Interlocked.CompareExchange(ref _frameTimer, null, created) == created)
+                created.Dispose();
+
+            return null;
+        }
+
+        return created;
+    }
 
     private void BeginInvokeFlush()
     {
@@ -2612,6 +2974,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
 
         PendingFlushCount++;
+        _flushStartedAt = Stopwatch.GetTimestamp();
         AdvanceFrameSlot();
 
         bool renderExpected = IsRenderExpected();
@@ -2632,6 +2995,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
 
         // 锁内只交换各曲线的待处理列表，写入在锁外进行，采集线程几乎不会被阻塞
+        bool clearAll;
+
         lock (_pendingLock)
         {
             foreach (PlotSeries series in _series)
@@ -2640,7 +3005,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 series.PendingClear = false;
                 (series.PendingValues, series.DrainingValues) = (series.DrainingValues, series.PendingValues);
             }
+
+            clearAll = _pendingClearAll;
+            _pendingClearAll = false;
         }
+
+        // 其它线程上的 ClearData 与 UI 线程上的一样解除 Y 锁定
+        if (clearAll)
+            _yLocked = false;
 
         bool cleared = false;
         bool mappingChanged = false;
@@ -2766,6 +3138,16 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
 
         _flushAwaitingRender = false;
+
+        // 空闲保护（设置了帧率上限时）：这一帧从合并写入到画完耗时越长，之后留出的空闲越长（20%，最少 2 ms），
+        // 让应用自己的 WinForms 定时器在重负载下也能运行
+        if (Interlocked.Read(ref _minFlushIntervalTicks) > 0)
+        {
+            long now = Stopwatch.GetTimestamp();
+            long busy = Math.Max(0, now - _flushStartedAt);
+            Interlocked.Exchange(ref _idleUntil, now + Math.Max(MinIdleGapTicks, busy / 5));
+        }
+
         CompletePendingFlush();
     }
 
@@ -2820,6 +3202,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 _canvas.MouseMove -= OnPlotMouseMove;
                 _canvas.MouseUp -= OnPlotMouseUp;
                 _canvas.MouseWheel -= OnPlotMouseWheel;
+                _canvas.PreviewKeyDown -= OnPlotPreviewKeyDown;
+                _canvas.KeyDown -= OnPlotKeyDown;
             }
 
             UnhookRenderFinished();

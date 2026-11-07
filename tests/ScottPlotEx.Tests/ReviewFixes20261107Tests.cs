@@ -450,9 +450,10 @@ public class ReviewFixes20261107Tests
         PlotDataBuffer buffer = new();
         double[] values = [1, double.NaN, 3];
 
-        Assert.Equal(2, buffer.AddRange(values));
-        Assert.Equal(2, buffer.AddRange(buffer.Values));
-        Assert.Equal([1.0, 3, 1, 3], buffer.Values);
+        // 缺失值也占一个位置（2026-11-07 矩阵审查 Q4）
+        Assert.Equal(3, buffer.AddRange(values));
+        Assert.Equal(3, buffer.AddRange(buffer.Values));
+        Assert.Equal([1.0, double.NaN, 3, 1, double.NaN, 3], buffer.Values);
     }
 
     [Fact(DisplayName = "3.3 Values 是只读视图：不能转换回 List 修改；快照可以在后台线程读取")]

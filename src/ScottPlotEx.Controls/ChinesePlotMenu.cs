@@ -115,13 +115,13 @@ public sealed class ChinesePlotMenu : IPlotMenu
         }
         catch (ArgumentException)
         {
-            MessageBox.Show("不支持该图像格式。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ReportError("不支持该图像格式。");
             return;
         }
 
         if (!TryGetImageSize(plot, out int width, out int height))
         {
-            MessageBox.Show("曲线区域尺寸为 0，无法保存图像。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ReportError("曲线区域尺寸为 0，无法保存图像。");
             return;
         }
 
@@ -131,7 +131,7 @@ public sealed class ChinesePlotMenu : IPlotMenu
         }
         catch (Exception)
         {
-            MessageBox.Show("保存图像失败。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ReportError("保存图像失败。");
         }
     }
 
@@ -145,7 +145,32 @@ public sealed class ChinesePlotMenu : IPlotMenu
 
         using ScottPlot.Image image = plot.GetImage(width, height);
         using Bitmap bitmap = image.GetBitmap();
-        Clipboard.SetImage(bitmap);
+
+        try
+        {
+            Clipboard.SetImage(bitmap);
+        }
+        catch (System.Runtime.InteropServices.ExternalException)
+        {
+            // 剪贴板正被其它程序占用（WinForms 重试约 1 秒后放弃）：提示即可，不能让异常从菜单点击冒到消息循环（需求 8）
+            ReportError("复制到剪贴板失败：剪贴板正被其它程序占用，请稍后重试。");
+        }
+    }
+
+    /// <summary>
+    /// 菜单操作失败时的提示方式（默认弹出错误消息框）。测试中替换为记录消息，避免弹出模态对话框。
+    /// </summary>
+    internal Action<string>? ErrorReporter { get; set; }
+
+    private void ReportError(string message)
+    {
+        if (ErrorReporter is { } reporter)
+        {
+            reporter(message);
+            return;
+        }
+
+        MessageBox.Show(message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     /// <summary>
