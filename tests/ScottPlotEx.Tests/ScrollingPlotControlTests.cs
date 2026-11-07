@@ -264,8 +264,8 @@ public class ScrollingPlotControlTests
         host.AssertNoUnhandledExceptions();
     }
 
-    [Fact(DisplayName = "健壮性：忽略 NaN 与 Infinity，不产生非法坐标")]
-    public void NonFiniteValues_AreIgnored()
+    [Fact(DisplayName = "健壮性：NaN 与 Infinity 按缺失值占位，不产生非法坐标")]
+    public void NonFiniteValues_AreMissingPlaceholders()
     {
         using WinFormsTestHost host = WinFormsTestHost.Start(() => new ScrollingPlotControl());
         ScrollingPlotControl plot = host.ControlAs<ScrollingPlotControl>();
@@ -280,8 +280,9 @@ public class ScrollingPlotControlTests
 
         host.Invoke(() =>
         {
-            Assert.Equal(1, plot.DataCount);
+            Assert.Equal(4, plot.DataCount);
             Assert.Equal(3, plot.SkippedValueCount);
+            Assert.Equal(3.5, plot.LatestValue);
 
             ScottPlot.AxisLimits limits = plot.Plot.Axes.GetLimits();
             Assert.True(limits.IsReal);

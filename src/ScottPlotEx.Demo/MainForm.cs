@@ -206,6 +206,9 @@ public sealed class MainForm : Form
         _syncingMode = true;
         try
         {
+            // 输入框上限随模式变化：堆叠模式可以超过 100%（右侧预留空白、分阶段扩展），跟随模式最大 100%
+            ScrollingMode mode = _plot.Mode == ScrollingMode.Manual ? _plot.LastAutoScrollMode : _plot.Mode;
+            _displayPercent.Maximum = mode == ScrollingMode.Follow ? 100m : (decimal)ScrollingAxisOptions.MaxStackedDisplayPercent;
             _displayPercent.Value = (decimal)Math.Round(_plot.CurrentXAxisDisplayPercent, 1);
         }
         finally

@@ -203,8 +203,12 @@ public class XAxisDisplayPercentTests
             plot.StackedDisplayPercent = -20;
             Assert.Equal(1.0, plot.StackedDisplayPercent, 9);
 
+            // 堆叠模式可以超过 100%（右侧预留空白），上限 1000%
             plot.StackedDisplayPercent = 500;
-            Assert.Equal(100.0, plot.StackedDisplayPercent, 9);
+            Assert.Equal(500.0, plot.StackedDisplayPercent, 9);
+
+            plot.StackedDisplayPercent = 5000;
+            Assert.Equal(ScrollingAxisOptions.MaxStackedDisplayPercent, plot.StackedDisplayPercent, 9);
 
             plot.FollowWindowPercent = 0;
             Assert.Equal(0.1, plot.FollowWindowPercent, 9);

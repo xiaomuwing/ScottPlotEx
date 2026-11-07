@@ -11,10 +11,16 @@ public sealed class ScrollingAxisOptions
     /// <summary>跟随模式窗口百分比的默认值（30 = 显示最后 30% 的数据）。</summary>
     public const double DefaultFollowWindowPercent = 30.0;
 
+    /// <summary>堆叠模式显示长度百分比的上限（1000 = X 轴长度为数据的 10 倍，曲线至少占宽度的 10%）。</summary>
+    public const double MaxStackedDisplayPercent = 1000.0;
+
     /// <summary>
-    /// 堆叠模式 X 轴显示长度百分比（1 ~ 100）。默认 100，即从 0 开始显示全部数据；
-    /// 设为 90 表示只显示最新 90% 的数据（左侧较早的数据被裁掉），数值越大看到的数据越多。
-    /// 窗口右端始终为“当前数据点数量 + 2”，左端 = 右端 ×（1 − 百分比）。
+    /// 堆叠模式 X 轴显示长度百分比（1 ~ 1000）。默认 100，即从 0 开始显示全部数据，右端为“当前数据点数量 + 2”。
+    /// <list type="bullet">
+    /// <item>小于 100：只显示最新的这部分数据（左侧较早的数据被裁掉）。设置时把左端固定为 右端 ×（1 − 百分比），之后不随数据移动。</item>
+    /// <item>大于 100：显示全部数据并在右侧预留空白，分阶段扩展：设置时把右端固定为“（数据点数量 + 2）× 百分比”，
+    /// 数据写到右端（右侧留白不足 2 个点）时再按同一比例扩展一次。例如 240 时曲线约占左侧 42%，坐标轴不会每来一个点就缩放一次。</item>
+    /// </list>
     /// </summary>
     public double StackedDisplayPercent { get; set; } = DefaultStackedDisplayPercent;
 
@@ -86,7 +92,7 @@ public sealed class ScrollingAxisOptions
 
     /// <summary>
     /// 重新选择滚动模式（设置 <c>Mode</c>）时，是否把该模式的 X 轴显示长度百分比恢复为默认值。
-    /// 默认 true：选择“堆叠模式”即回到 0%（显示全部数据），选择“跟随模式”即回到 30% 窗口，
+    /// 默认 true：选择“堆叠模式”即回到 100%（显示全部数据），选择“跟随模式”即回到 30% 窗口，
     /// 避免之前调整过的百分比让视图一直停留在被裁短的状态。设为 false 可让百分比跨模式切换保持。
     /// </summary>
     public bool ResetDisplayPercentOnModeChange { get; set; } = true;
@@ -152,9 +158,9 @@ public sealed class ScrollingAxisOptions
         }
     }
 
-    /// <summary>把堆叠模式显示长度百分比限制在 1 ~ 100（非有限值按默认 100 处理）。</summary>
+    /// <summary>把堆叠模式显示长度百分比限制在 1 ~ <see cref="MaxStackedDisplayPercent"/>（非有限值按默认 100 处理）。</summary>
     public static double ClampDisplayPercent(double percent) =>
-        double.IsFinite(percent) ? Math.Clamp(percent, 1.0, 100.0) : DefaultStackedDisplayPercent;
+        double.IsFinite(percent) ? Math.Clamp(percent, 1.0, MaxStackedDisplayPercent) : DefaultStackedDisplayPercent;
 
     /// <summary>把跟随模式窗口百分比限制在 0.1 ~ 100（非有限值按默认 30 处理）。</summary>
     public static double ClampWindowPercent(double percent) =>

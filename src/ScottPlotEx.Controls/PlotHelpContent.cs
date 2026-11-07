@@ -17,7 +17,9 @@ public static class PlotHelpContent
            X 轴范围：0 ~ 当前数据点数量 + 2（默认显示全部数据）
            “X 轴显示 %”控制显示长度：设置时把原点固定在 当时的（点数+2）× (1−百分比)，
            之后原点不再移动，数据增长只向右扩展（默认 100% = 原点 0，显示全部数据；
-           设为 90 表示原点固定在设置时刻 10% 的位置）
+           设为 90 表示原点固定在设置时刻 10% 的位置）。
+           超过 100%（最大 1000%）表示右侧预留空白：例如 240% 时曲线约占左侧 42%，
+           坐标轴在数据写满之前保持不动，写满后再按同一比例扩展。
            Y 轴范围：已添加数据的最大值与最小值各向外让出 5%
 
         2. 跟随模式
@@ -49,29 +51,32 @@ public static class PlotHelpContent
         【鼠标操作】
 
         · 左键拖动：平移视图。
-          拖动后仍能看到最新数据 -> 保持当前模式，X 轴最小值取当前最小值，曲线继续滚动；
+          拖动后仍能看到（按下鼠标时的）最新数据 -> 保持当前模式，X 轴最小值取当前最小值，曲线继续滚动；
           拖动后看不到最新数据 -> 曲线停止滚动（手动模式）。
+          继续滚动时若在竖直方向拖动过，Y 轴锁定在拖动后的范围（X 照常滚动），中键单击恢复自动。
 
-        · 中键拖动：框选放大，处理逻辑与左键拖动完全一致。
+        · 中键拖动：框选放大，处理逻辑与左键拖动完全一致（继续滚动时 Y 轴锁定为框选的范围）。
 
         · 右键拖动：缩放视图（默认停止滚动）。
 
         · 滚轮：以鼠标位置为中心缩放（默认停止滚动）。
 
-        · 中键单击：自动缩放（整体显示全部数据）。
+        · 中键单击：整体显示全部数据。
           若此时曲线已停止滚动，会退出停止状态并继续滚动；
-          若此时是跟随模式，会自动切换为堆叠模式（跟随模式只显示最新 30% 数据，与整体显示冲突）。
+          若此时是跟随模式，会自动切换为堆叠模式（跟随模式只显示最新 30% 数据，与整体显示冲突）；
+          堆叠显示百分比恢复为 100%，Y 轴恢复自动。
 
         · 右键单击：弹出菜单（保存图像 / 复制到剪贴板 / 自动缩放 / 在新窗口中打开 / 显示帮助）。
 
         · 左键双击：ScottPlot 自带的性能基准测试。
 
-        · 键盘：方向键平移，A 键自动缩放。
+        · 键盘：方向键平移（规则同左键拖动），Ctrl + 方向键缩放（停止滚动），A 键整体显示（同中键单击）。
 
 
         【数据接口】
 
         · AddValue(double y)：向默认曲线追加一个数据点（点数单位下 X 从 1 开始自动递增）。
+          NaN / Infinity 等缺失值也占一个位置，曲线在该处断开，之后的点不会错位。
         · AddValues(...)：向默认曲线批量追加数据点。
         · AddSeries(名称, 颜色)：添加一条曲线，之后通过它 AddValue / AddValues / Clear / Remove；
           各曲线数据独立，坐标轴按所有可见曲线计算（任意线程都可以写入）。
@@ -79,7 +84,7 @@ public static class PlotHelpContent
         · FollowWindowPoints：跟随模式固定显示最后 N 个点（0 = 按百分比）。
         · FollowWindowDuration：时间单位下跟随模式固定显示最近这么长时间（0 = 按点数换算或百分比）。
         · XAxisUnit：X 轴单位（Samples 点数 / RelativeTime 相对时间 / AbsoluteTime 绝对时间）。
-        · MaxFramesPerSecond：跨线程写入时的重绘帧率上限（0 = 不限）。
+        · MaxFramesPerSecond：跨线程写入时的重绘帧率上限（默认 60，0 = 不限）。
         · AxisUpdateMode：UI 线程逐点写入时坐标轴的更新时机（默认自动：曲线多时合并到本轮消息处理结束后计算一次）；
           UpdateAxesNow() 立即完成合并中的更新。
         · AxisOptions：直接修改其中的参数后调用 ApplyAxisOptions() 立即生效。
@@ -91,8 +96,11 @@ public static class PlotHelpContent
         · GetXAxisDisplayPercent(模式) / CurrentXAxisDisplayPercent：读取当前百分比
         · StackedDisplayPercent / FollowWindowPercent：直接读写两种模式的百分比（默认 100% / 30%）
         · ShowAllData()：恢复显示全部数据（堆叠显示百分比设为 100%）
+        · IsYAxisLocked / ResetYAxis()：Y 轴是否被用户调整锁定 / 解除锁定
         · 重新选择模式会回到该模式的默认视图：选择堆叠模式 = 100%（显示全部数据），
           选择跟随模式 = 默认 30% 窗口（可用 AxisOptions.ResetDisplayPercentOnModeChange 关闭）
+        · 线程：数据接口与 PlotSeries 的属性可在任意线程调用（不等待 UI 线程）；
+          Mode、百分比、XAxisUnit、Reset 等配置接口只能在 UI 线程调用。
         · 所有 IPlotControl 接口（Plot、Menu、UserInputProcessor 等）均由本控件与画布实现（不再内嵌 FormsPlot）。
         """;
 }

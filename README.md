@@ -13,7 +13,7 @@
 ScottPlotEx.sln
 ├─ src/ScottPlotEx.Controls   用户控件库（核心交付物）
 ├─ src/ScottPlotEx.Demo       演示程序：每秒添加 1 个数据点、可切换模式；另有“多曲线测试”“10 曲线流式演示”“堆叠堆积压测”窗口
-├─ tests/ScottPlotEx.Tests    自动化测试（236 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
+├─ tests/ScottPlotEx.Tests    自动化测试（276 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
 ├─ artifacts/                 测试生成的示例图片
 ├─ docs/                      真实演示程序运行截图
 ├─ LICENSE                    本项目许可（MIT）
@@ -24,7 +24,7 @@ ScottPlotEx.sln
 
 ```powershell
 dotnet build ScottPlotEx.sln          # 生成解决方案
-dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（236 个）
+dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（276 个）
 dotnet test  ScottPlotEx.sln -c Release --filter "Category=Performance"   # 只跑性能基准（必须 Release）
 dotnet run --project src\ScottPlotEx.Demo   # 运行演示程序
 dotnet run --project src\ScottPlotEx.Demo -- --multiseries   # 直接打开“多曲线测试”窗口（--preset 0/1/2 选择预设场景，--unit 0/1/2 选择 X 轴单位；--unit 2 绝对时间会自动把起始时间设为当前时间）
@@ -131,9 +131,9 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | 补充 2 | 跟随模式下按鼠标中键，自动换成堆叠模式 | `AutoScrollPolicy.ResolveAutoscaleMode`：整体显示时跟随模式解析为堆叠模式（`SwitchToStackedOnAutoscale`，默认开启） | `AutoScrollPolicyTests.ResolveAutoscaleMode_*`、`MouseInteractionTests.MiddleClickAutoscale_InFollowMode_SwitchesToStackedMode`、`DemoScreenshotTests`、`docs/demo-06-follow-mode.png` → `docs/demo-07-follow-to-stacked.png` |
 | 补充 4 | 鼠标一操作就出现的那次卡顿要去掉 | ① **鼠标手势期间暂停自动滚动**：按住鼠标并拖动（左键平移 / 中键框选 / 右键缩放）时，新数据只进缓冲区、不再移动坐标轴，避免每个数据点都把视图拉回自动窗口（实测一次回跳 500+ 个数据点）并覆盖用户的拖动结果；② **画布失去焦点时不再同步整帧重绘**，改为合并重绘（仍保留“焦点丢失即终止拖动”的 ScottPlot 语义），去掉鼠标刚点下瞬间的一次整帧重绘 | `AutoScrollDuringGestureTests`、`InteractionSmoothnessTests` |
 | 补充 5 | 两种模式都要能设置 X 轴显示长度（百分比接口） | `SetXAxisDisplayPercent(percent, mode)`（写入必须指定模式）+ 只读的 `CurrentXAxisDisplayPercent`/`GetXAxisDisplayPercent(mode)` + `ShowAllData()`；底层为 `StackedDisplayPercent`（默认 100 = 全部数据）与 `FollowWindowPercent`（默认 30，尾部窗口）。**方向一致：数值越大看得越多**，越界自动限制，改动后立即重算坐标轴且不切换模式 | `XAxisDisplayPercentTests`、`ReproFollowToStackedTests.StackedMode_DisplayPercent90_StillLooksStacked`、`ScrollingAxisCalculatorTests.StackedMode_DisplayPercent*` / `FollowMode_WindowPercent*` |
-| 补充 6 | 调整百分比后必须能改回堆叠模式 | **重新选择模式即恢复该模式默认视图**：选择“堆叠模式”把原点百分比复位为 0%（`X: [0, 点数+2]`），选择“跟随模式”把窗口复位为 30%；数据更新、拖动、中键整体显示都不会复位。可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 改为“百分比跨模式保持” | `ReproFollowToStackedTests.AfterChangingStackedPercent_ReselectingStackedShowsAllData` / `AfterChangingFollowPercent_ReselectingFollowRestoresDefaultWindow` / `DisplayPercent_CanPersistAcrossModeChanges`、`docs/demo-08-stacked-after-percent.png` |
+| 补充 6 | 调整百分比后必须能改回堆叠模式 | **重新选择模式即恢复该模式默认视图**：选择“堆叠模式”把显示百分比复位为 100%（`X: [0, 点数+2]`），选择“跟随模式”把窗口复位为 30%；中键整体显示同样把堆叠百分比恢复为 100%；数据更新、拖动不会复位。可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 改为“百分比跨模式保持” | `ReproFollowToStackedTests.AfterChangingStackedPercent_ReselectingStackedShowsAllData` / `AfterChangingFollowPercent_ReselectingFollowRestoresDefaultWindow` / `DisplayPercent_CanPersistAcrossModeChanges`、`docs/demo-08-stacked-after-percent.png` |
 | 补充 7 | X 轴单位对标 imc：点数 / 相对时间 / 绝对时间；每条曲线可以有自己的采样间隔；跟随窗口同样支持三种单位；时间单位下平滑滚动；绝对时间必须设置起始时间 | `XAxisUnit`、`PlotSeries.SampleInterval / SampleRate / StartTime`、`DefaultSampleInterval / DefaultStartTime`、`FollowWindowDuration`；所有按 X 计算的地方按曲线做“下标 ↔ X”换算（`SeriesXExtent`、`PlotDataBuffer.XStart / XStep`、数据源 `Period / XOffset`）；`TimeAxisTickGenerator` 生成时间刻度 | `XAxisUnitTests`、`XAxisUnitDemoTests`、`artifacts/x-axis-*.png` |
-| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 236 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
+| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 276 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
 
 ## 控件 API
 
@@ -145,9 +145,9 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `AddValue(double y)` | 向**默认曲线**追加一个数据点，X 自动递增（点数单位第 n 个点 X = n；时间单位见 `XAxisUnit`）。**可在任意线程调用** |
 | `AddValues(IEnumerable<double>)` / `AddValues(params double[])` / `AddValues(ReadOnlySpan<double>)` | 向默认曲线批量追加 |
 | `ClearData()` | 清空**全部曲线**的数据（曲线本身保留）并回到空视图 |
-| `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 默认曲线的数据查询（NaN、Infinity 会被忽略并计入 `SkippedValueCount`）。`Values` 是内部数据的实时**只读视图**（不复制，只应在 UI 线程上读取，不能转换回 `List` 修改） |
-| `GetValuesSnapshot()` | 复制一份默认曲线的全部数据，**可在任意线程调用**（非 UI 线程同步切换到 UI 线程复制） |
-| `AddSeries(name, color?, startTime?)` → `PlotSeries` | 添加一条曲线（不指定颜色时按调色板取色；`startTime` 等同于创建后设置 `PlotSeries.StartTime`）。可在任意线程调用。绝对时间单位下既没有 `startTime` 也没有 `DefaultStartTime` 时抛出 `InvalidOperationException` |
+| `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 默认曲线的数据查询。缺失值（NaN、±Infinity、绝对值超过 1e300）**占一个位置**（之后的点 X 不错位），绘制时在该处断开，计入 `SkippedValueCount`；`DataCount` 包含缺失点，`LatestValue` 可能是 NaN。`Values` 是内部数据的实时**只读视图**（不复制，只应在 UI 线程上读取，不能转换回 `List` 修改） |
+| `GetValuesSnapshot()` | 复制一份默认曲线的全部数据，**可在任意线程调用**（非 UI 线程同步切换到 UI 线程复制；UI 线程正在等待调用线程时不要调用，否则互相等待） |
+| `AddSeries(name, color?, startTime?)` → `PlotSeries` | 添加一条曲线（不指定颜色时按调色板取色；`startTime` 等同于创建后设置 `PlotSeries.StartTime`）。可在任意线程调用：非 UI 线程上立即返回曲线，挂接排队到 UI 线程，**不等待 UI 线程**（UI 线程正在等待采集线程时也不会互相卡死）。绝对时间单位下既没有 `startTime` 也没有 `DefaultStartTime` 时抛出 `InvalidOperationException` |
 | `Series` / `DefaultSeries` | 全部曲线的快照（默认曲线在第一位）/ 默认曲线（单曲线接口读写的曲线，始终存在、不能删除） |
 | `ShowLegend` | 是否显示图例（列出名称不为空的曲线；默认曲线名称为空，不出现在图例里），默认 `false` |
 | `FollowWindowPoints` | 跟随模式固定窗口宽度（数据点），默认 `0` = 按 `FollowWindowPercent`；大于 0 时始终显示最后这么多个点（示波器式滚动），重新选择跟随模式不会复位。点数单位使用；时间单位下若没有设置 `FollowWindowDuration`，按各曲线的采样间隔换算成时长（取最长的一条） |
@@ -156,14 +156,15 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `DefaultSampleInterval` | 曲线默认的采样间隔（`TimeSpan`，默认 1 秒），没有设置 `PlotSeries.SampleInterval` 的曲线使用；只在时间单位下影响 X |
 | `DefaultStartTime` | 曲线默认的起始时间（`DateTime?`，默认 `null` = 相对时间下每条曲线以自己第一个数据点写入控件的时刻为起始时间；绝对时间不使用该时刻）。绝对时间单位下若有曲线依赖它，设为 `null` 抛出 `InvalidOperationException`。设置后清空数据不会改变它 |
 | `TimeReference` | 时间单位下 X = 0 对应的时刻（全部曲线生效起始时间中最早的一个，只读）；任意 X 的时刻 = `TimeReference + X 秒` |
-| `MaxFramesPerSecond` | 跨线程写入触发的重绘帧率上限，默认 `0` = 不限。高精度定时器按固定时间表（帧时刻 = 上一帧时刻 + 间隔）调度，30 就是 30 帧/秒、不随定时迟到漂移（不受 WinForms 定时器约 15.6 ms 精度影响）；数据照常全部接收。改回 `0` 时释放定时线程。不限帧率且数据持续到达时 UI 线程会连续绘制，窗体上的 WinForms 定时器可能得不到处理，此时请设置帧率上限。控件不会绘制（最小化 / 不可见）时合并写入按 100 ms 节流 |
+| `MaxFramesPerSecond` | 跨线程写入触发的重绘帧率上限，**默认 `60`**，`0` = 不限。高精度定时器（独立线程，约 1 ms 精度）按固定时间表（帧时刻 = 上一帧时刻 + 间隔）调度，60 就是 60 帧/秒、不随定时迟到漂移（不受 WinForms 定时器约 15.6 ms 精度影响）；数据照常全部接收。设置了上限时每帧画完后至少空闲“帧耗时的 20%，最少 2 ms”，即使每帧耗时超过帧间隔（曲线很多、窗口很大），窗体上的 WinForms 定时器也能照常触发；设为 `0` 时不做这项保护，UI 线程可能连续绘制、窗体定时器得不到处理。改回 `0` 时释放定时线程；定时线程在第一次跨线程写入时才创建。控件不会绘制（最小化 / 不可见）时合并写入按 100 ms 节流 |
 | `AxisUpdateMode`（`AxisUpdateMode`） | UI 线程逐点写入时坐标轴的更新时机：`Auto`（默认：可见曲线不超过 `AutoDeferVisibleSeriesThreshold` = 8 条时立即更新，更多时合并）/ `Immediate`（每次写入立即重算）/ `Deferred`（合并到本轮消息处理结束后、绘制与输入之前计算一次，逐点开销不再随曲线数增长）。跨线程写入按帧合并，不受影响 |
 | `UpdateAxesNow()` | 立即完成合并中的坐标轴更新：合并模式下在写入数据的同一段代码里读取 `Plot.Axes.GetLimits()`、或直接用 `Plot` 导出图像之前调用 |
 | `IsScrollingStopped` / `XOffset` | 是否已停止滚动 / 当前 X 轴偏移量 |
 | `LastAutoScrollMode` | 最近一次的自动滚动模式（堆叠或跟随），中键单击整体显示后恢复到该模式 |
 | `SetXAxisDisplayPercent(percent, mode)` | 设置**指定模式**的 X 轴显示长度百分比（模式必填），立即生效；堆叠=按当前点数把原点**固定**在该百分比处（100=原点 0 显示全部），跟随=显示最后 `百分比` 的滑动窗口 |
 | `CurrentXAxisDisplayPercent` / `GetXAxisDisplayPercent(mode)` | 读取当前模式 / 指定模式的百分比（只读，安全） |
-| `StackedDisplayPercent` / `FollowWindowPercent` | 直接读写两种模式的百分比（默认 `100` / `30`），越界值自动限制在有效范围 |
+| `StackedDisplayPercent` / `FollowWindowPercent` | 直接读写两种模式的百分比（默认 `100` / `30`），越界值自动限制在有效范围（堆叠 1 ~ 1000，跟随 0.1 ~ 100） |
+| `IsYAxisLocked` / `ResetYAxis()` | 自动滚动期间用户在 Y 方向调整过视图（左键拖动的竖直移动达到 5 像素、中键框选、方向键 ↑↓）后 Y 被锁定：X 继续滚动，Y 保持用户的范围。整体显示、重新选择模式、`ClearData()`、`Reset()`、`ResetYAxis()` 时解除 |
 | `ShowAllData()` | 恢复显示全部数据（把堆叠模式显示百分比设为 `100`） |
 | `AxisOptions`（`ScrollingAxisOptions`） | 留白比例、窗口百分比、各类策略开关等可调参数。直接修改其中的字段后调用 `ApplyAxisOptions()` 立即生效 |
 | `ApplyAxisOptions()` | 校验 `AxisOptions`（无效参数抛出 `ArgumentException`）、把百分比限制在有效范围、重新固定堆叠原点并重算坐标轴 |
@@ -184,12 +185,12 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `AddValue(double)` / `AddValues(IEnumerable<double>)` / `AddValues(params double[])` / `AddValues(ReadOnlySpan<double>)` | 写入本曲线。**可在任意线程调用**：UI 线程上同步生效；非 UI 线程上先进入本曲线的待处理列表，所有曲线共用同一条按帧合并的窗口消息，同一线程内的写入与清空顺序不变 |
 | `Clear()` | 清空本曲线（其它曲线不受影响），可在任意线程调用 |
 | `Remove()` | 删除本曲线（之后的写入被忽略）；默认曲线不能删除，会抛出 `InvalidOperationException` |
-| `Name` / `Color` / `LineWidth` / `IsVisible` | 外观（图例名称 / 颜色 / 线宽，默认 1 / 是否显示）。非 UI 线程调用时同步切换到 UI 线程。隐藏的曲线不参与坐标轴计算 |
+| `Name` / `Color` / `LineWidth` / `IsVisible` | 外观（图例名称 / 颜色 / 线宽，默认 1 / 是否显示）。可在任意线程设置：非 UI 线程上排队到 UI 线程、**不等待**，读取立即返回新值。只修改这一项（直接通过 `Signal` 改过的其它样式保持不变）。隐藏的曲线不参与坐标轴计算 |
 | `SampleInterval` / `SampleRate` | 采样间隔（`TimeSpan`）/ 采样率（点/秒），时间单位下决定 X。默认取控件的 `DefaultSampleInterval`（读取返回生效的值），`SampleInterval = TimeSpan.Zero` 恢复默认。`SampleRate` 按双精度保存，不受 `TimeSpan` 100 ns 精度限制（例如 3000 点/秒的 333.33… µs），长时间运行不累积误差 |
 | `StartTime` | 起始时间（第一个数据点的时刻，`DateTime?`）。读取返回生效的值：本曲线设置的值 → 控件的 `DefaultStartTime` → 第一个数据点写入控件的时刻（清空后重新记录；绝对时间单位下不使用）；设为 `null` 恢复默认——绝对时间单位下若控件也没有 `DefaultStartTime` 则抛出 `InvalidOperationException`（跨线程设置时抛给调用方） |
 | `RejectedValueCount` | 绝对时间单位下因为没有起始时间而被拒收的数据点数量（只可能出现在没人设置起始时间的默认曲线上，见“行为细则 → X 轴单位”）；清空本曲线时归零 |
-| `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 本曲线的数据查询（`LatestX` 按当前单位：点数单位等于点数，时间单位为距 `TimeReference` 的秒数；`Values` 为只读视图，只应在 UI 线程上读取） |
-| `GetValuesSnapshot()` | 复制一份本曲线的全部数据，**可在任意线程调用** |
+| `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 本曲线的数据查询（缺失值占位、计入 `SkippedValueCount`，见默认曲线的说明；`LatestX` 按当前单位：点数单位等于点数，时间单位为距 `TimeReference` 的秒数；`Values` 为只读视图，只应在 UI 线程上读取） |
+| `GetValuesSnapshot()` | 复制一份本曲线的全部数据，**可在任意线程调用**（非 UI 线程会等待 UI 线程完成复制） |
 | `GetX(index)` | 第 `index` 个数据点（下标从 0 开始）在当前单位下的 X 坐标 |
 | `Signal` | 本曲线的 ScottPlot 图元（可修改更多样式；`Reset()` 后挂到新绘图对象上时，直接改过的样式会保留） |
 
@@ -291,7 +292,9 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 - 隐藏的曲线（`IsVisible = false`）不绘制，也不参与 X / Y 的自动计算；显示 / 隐藏、删除曲线后立即按剩余可见曲线重算坐标轴。
 - `ClearData()` 清空全部曲线的数据；`PlotSeries.Clear()` 只清空一条，其它曲线的数据与用户的拖动结果保留。
 
-范围限制：堆叠 `1% ~ 100%`，跟随 `0.1% ~ 100%` 且窗口至少 2 个数据点宽（保证最新数据点始终可见）。
+范围限制：堆叠 `1% ~ 1000%`，跟随 `0.1% ~ 100%` 且窗口至少 2 个数据点宽（保证最新数据点始终可见）。
+
+**堆叠百分比超过 100%：右侧预留空白，分阶段扩展。** 设置时把右端固定为“（点数 + 2）× 百分比”，曲线只占左侧一部分（240% 时约 42%），坐标轴在数据写满之前保持不动；数据写到右端（右侧留白不足 2 个点）时再按同一比例扩展一次。例如 100 个点时设 240% → `X: [0, 244.8]`，写到第 243 个点时扩展为 `X: [0, 588]`。这样每秒来一个点时坐标轴不会每秒整体缩放一次。时间单位同理。中键整体显示、重新选择堆叠模式都会把它恢复为 100%。
 改动百分比会立即生效（堆叠=重新固定原点），**但不会切换模式**；重新选择模式会把该模式的百分比复位为默认值
 （可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 关闭），`ShowAllData()` 等价于把堆叠显示百分比设为 100%。
 
@@ -306,7 +309,8 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 |---|---|
 | 选择“堆叠模式” | 显示百分比复位为 `100%` → X 轴 `[0, 点数+2]`，即显示全部数据 |
 | 选择“跟随模式” | 窗口百分比复位为 `30%` → 显示最后 30% 数据 |
-| 数据持续更新 / 鼠标拖动 / 中键整体显示 | 百分比**保持不变**（只有“重新选择模式”才会复位） |
+| 中键单击 / 菜单“自动缩放” / A 键（整体显示） | 堆叠百分比**一律恢复为 100%**（无论原来小于还是大于 100%） |
+| 数据持续更新 / 鼠标拖动 | 百分比**保持不变** |
 
 这样“把显示长度调短之后，再点一次堆叠模式”就一定能回到完整视图，不会出现“选了堆叠模式却还是被裁短的跟随样子”的情况。
 
@@ -351,9 +355,16 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
   Y 轴按窗口统计、越界判断（`PlotDataBuffer.XStart / XStep / TryGetIndexRange`）；渲染与最近点查询（数据源的 `Period / XOffset`）。
 
 **Y 轴范围**：`[最小值 − 5% × 跨度, 最大值 + 5% × 跨度]`；跨度为 0（数据完全水平）时使用 `max(|值| × 5%, 0.5)`，
-避免 Y 轴退化成一条线。堆叠模式统计**全部数据**，跟随模式统计**当前显示的数据**。
+避免 Y 轴退化成一条线。堆叠模式统计**全部数据**，跟随模式统计**当前显示的数据**；缺失值不参与统计。
+用户在 Y 方向调整过视图（左键拖动的竖直移动达到 5 像素、中键框选、方向键 ↑↓）且继续滚动时，**Y 锁定**为用户的范围（X 继续滚动），
+整体显示、重新选择模式、清空数据、`ResetYAxis()` 时恢复自动。
 
-**“能看到最新数据”的判定**：最新数据点（各可见曲线最后一个点中 X 最大的那个）的 X 坐标落在当前 X 轴范围内（含 0.1% 跨度的容差）。
+**缺失值**：NaN、±Infinity、绝对值超过 1e300 的值占一个位置（之后的点 X 不错位，多条曲线按序号 / 时间的对齐保持不变），
+绘制时在缺失处断开（缺失段短于一个像素列时不断开，避免高密度数据被切碎）；Y 轴自动范围、数据游标都跳过缺失值。
+数据源知道丢了一个采样时，写入一个 `double.NaN` 即可保持对齐。
+（ScottPlot 5.1.59 自带的 Signal 遇到 NaN 会整条连线消失，控件用 `GapAwareSignal` 分段绘制，不含缺失值时与 ScottPlot 逐像素一致。）
+
+**“能看到最新数据”的判定**：最新数据点（各可见曲线最后一个点中 X 最大的那个）的 X 坐标落在当前 X 轴范围内（含 0.1% 跨度的容差）。鼠标手势用**按下鼠标时**的最新数据点判断（手势期间坐标轴暂停，期间到达的数据不计入，否则数据持续到达时几乎任何拖动都会停止滚动）；滚轮、键盘是瞬间完成的操作，按当前最新数据判断。
 
 **停止滚动的时机**（均为默认行为，可通过 `AxisOptions` 调整）：
 
@@ -362,8 +373,9 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | 左键拖动后仍能看到最新数据 | 保持当前模式，X 轴最小值取当前最小值（继续滚动） |
 | 左键拖动后看不到最新数据 | 停止滚动（手动模式） |
 | 中键框选放大 | 与左键拖动规则完全一致 |
-| 滚轮缩放 / 右键拖动缩放 | 停止滚动（需求 3：放大局部数据后停止滚动） |
-| 中键单击 / 菜单“自动缩放”（整体显示） | ① 若已停止滚动 → 退出停止状态（回到暂停前的模式）；② 若（此时或恢复后）是**跟随模式 → 自动换成堆叠模式**；③ 复位 X 轴偏移并保持滚动 |
+| 滚轮缩放 / 右键拖动缩放 / Ctrl + 方向键缩放 | 停止滚动（需求 3：放大局部数据后停止滚动） |
+| 方向键平移 | 与左键拖动规则一致 |
+| 中键单击 / 菜单“自动缩放” / A 键（整体显示） | ① 若已停止滚动 → 退出停止状态（回到暂停前的模式）；② 若（此时或恢复后）是**跟随模式 → 自动换成堆叠模式**；③ 堆叠百分比恢复为 100%、复位 X 轴偏移、解除 Y 锁定，**立即**显示该模式的自动视图（堆叠即 `X: [0, 点数+2]`、Y 上下各外扩 5%） |
 | 重新选择堆叠/跟随模式 | 复位偏移，立即恢复自动滚动 |
 
 **鼠标手势期间不自动滚动**：一旦按住鼠标并产生拖动（左键平移 / 中键框选 / 右键缩放），
@@ -376,11 +388,14 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 左键拖动 = 平移；中键拖动 = 框选放大；右键拖动 = 缩放；滚轮 = 缩放；中键单击 = 自动缩放；
 右键单击 = 弹出菜单（保存图像 / 复制到剪贴板 / 自动缩放 / 在新窗口中打开 /
 　勾选项：堆叠模式 / 跟随模式 / 手动模式（停止滚动）/ 显示帮助）；
-左键双击 = ScottPlot 性能基准测试；方向键 = 平移；A 键 = 自动缩放。
+左键双击 = ScottPlot 性能基准测试；方向键 = 平移；Ctrl + 方向键 = 缩放；A 键 = 自动缩放（键盘操作与对应的鼠标操作按同样的规则切换滚动状态）。
 
 **其它**
 
 - 控件默认使用 `Microsoft YaHei UI` 字体，避免标题/坐标轴中的中文显示为方块；字体不存在时自动回退到 ScottPlot 默认字体。
+- **线程**：数据接口（`AddValue` / `AddValues` / `ClearData` / `AddSeries`）与 `PlotSeries` 的属性、`Remove()` 可以在任意线程调用，非 UI 线程上**不等待** UI 线程；
+  控件自身的配置接口（`Mode`、`StopScrolling`、百分比与窗口属性、`XAxisUnit`、`DefaultSampleInterval`、`DefaultStartTime`、`ShowLegend`、`ApplyAxisOptions`、`Reset`、`ShowHelp`、`Refresh` 等）
+  只能在 UI 线程调用，在其它线程调用时立即抛出 `InvalidOperationException`（它们直接修改 Plot，在其它线程上会与渲染并发）。`RequestRender()` 可以在任意线程调用。
 - `AddValue` / `AddValues` / `ClearData` 可以在任意线程调用：UI 线程上同步生效（调用返回时数据已写入；坐标轴在可见曲线不超过 8 条时已更新，
   更多曲线时合并到本轮消息处理结束后统一计算，见 `AxisUpdateMode`）；UI 线程上的 `ClearData` / `Clear` / `Reset` 会一并丢弃此前从其它线程写入、尚未合并的数据；
   非 UI 线程上先进入内部待处理列表，由 UI 线程**按帧整批写入**——无论采集线程调用多频繁，窗口消息队列里最多只有一条合并写入消息，
@@ -408,7 +423,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 
 ```powershell
 dotnet test ScottPlotEx.sln
-# 已通过! - 失败: 0，通过: 236，已跳过: 0，总计: 236（不含 Category=Performance）
+# 已通过! - 失败: 0，通过: 276，已跳过: 0，总计: 276（不含 Category=Performance）
 ```
 
 测试分两类：
@@ -647,7 +662,7 @@ Release 配置的解决方案构建**（例如 `dotnet build ScottPlotEx.sln -c 
 | 渲染 | 每 5 分钟一次的“强制整帧绘制”耗时探针（毫秒），用于观察绘制是否随运行时间劣化 |
 | 响应性 | UI 线程响应延迟（看门狗用 `BeginInvoke` 往返测量），按阶段分别统计最大 / 平均延迟 |
 | 正确性 | 坐标轴必须是有限实数范围且不退化（`xMax > xMin`、`yMax > yMin`）、`Values.Count` 必须等于 `DataCount`、`LatestX` 必须等于 `DataCount` |
-| 健壮性 | 混入少量 `NaN` / `Infinity`（应被忽略并计入 `SkippedValueCount`）；释放后再调用数据接口、句柄销毁期间调用等边界情形 |
+| 健壮性 | 混入少量 `NaN` / `Infinity`（按缺失值占位并计入 `SkippedValueCount`）；释放后再调用数据接口、句柄销毁期间调用等边界情形 |
 
 ### 产物与停止方式
 
@@ -668,7 +683,10 @@ Release 配置的解决方案构建**（例如 `dotnet build ScottPlotEx.sln -c 
 ### 实测发现一：高频跨线程灌入会“饿死”窗口定时器与重绘
 
 > **已在控件内修复（2026-10-10）**：跨线程写入改为“待处理列表 + 按帧合并写入”，同一时刻最多只有一条合并写入消息，
-> 并在每帧渲染完成后才允许下一次投递，因此消息队列始终能空出来让 `WM_PAINT` / `WM_TIMER` 插入（`CrossThreadIngestTests`）。
+> 并在每帧渲染完成后才允许下一次投递，因此消息队列始终能空出来让 `WM_PAINT` 插入（`CrossThreadIngestTests`）。
+> **补充（2026-11-07）**：不限帧率时“合并写入 → 绘制”仍会首尾相接、挤掉优先级最低的 `WM_TIMER`；
+> 现在 `MaxFramesPerSecond` 默认 60，并在每帧之后至少空闲“帧耗时的 20%，最少 2 ms”，每帧耗时超过帧间隔的重负载下窗体定时器也能照常触发
+> （`MatrixReviewFixesTests.DefaultFrameCap_And_IdleGapKeepsWinFormsTimersAlive`）。
 > 以下为修复前的实测记录，保留作为背景。
 
 高频跨线程调用 `AddValue` / `AddValues` 时，控件内部用 `BeginInvoke` 把每次调用编组到 UI 线程，等于**每次调用投递一条窗口消息**。

@@ -10,8 +10,10 @@ namespace ScottPlotEx.Controls;
 /// <item>数据接口（<see cref="AddValue"/> / <see cref="AddValues(ReadOnlySpan{double})"/> / <see cref="Clear"/>）可在任意线程调用：
 /// UI 线程上同步生效；非 UI 线程上先进入本曲线的待处理列表，由控件按帧整批写入
 /// （所有曲线共用同一条合并消息，同一线程内的写入与清空顺序保持不变）。</item>
-/// <item>外观与结构接口（<see cref="Name"/> / <see cref="Color"/> / <see cref="LineWidth"/> / <see cref="IsVisible"/> / <see cref="Remove"/>）
-/// 在 UI 线程上执行，从其它线程调用时会同步切换到 UI 线程。</item>
+/// <item>外观与结构接口（<see cref="Name"/> / <see cref="Color"/> / <see cref="LineWidth"/> / <see cref="IsVisible"/> /
+/// <see cref="SampleInterval"/> / <see cref="SampleRate"/> / <see cref="StartTime"/> / <see cref="Remove"/>）也可以在任意线程调用：
+/// UI 线程上立即生效；其它线程上排队到 UI 线程执行、调用不等待（不会因为 UI 线程正在等待采集线程而互相卡死），
+/// 读取属性立即返回新值，界面在 UI 线程处理到这次修改时更新。</item>
 /// </list>
 /// </summary>
 public sealed class PlotSeries
@@ -21,6 +23,12 @@ public sealed class PlotSeries
     private ScottPlot.Color _color;
     private float _lineWidth = 1f;
     private bool _isVisible = true;
+
+    /// <summary>
+    /// 从其它线程设置、尚未在 UI 线程应用到图元的外观修改数量。大于 0 时外观属性返回本地保存的新值，
+    /// 否则返回图元上的值（用户可能直接通过 <see cref="Signal"/> 修改过样式）。
+    /// </summary>
+    private int _pendingStyleChanges;
 
     /// <summary>用户通过 <see cref="Signal"/> 直接修改的线型 / 标记样式（Reset 重建图元时原样恢复）。</summary>
     private ScottPlot.LineStyle? _lineStyle;
@@ -99,51 +107,78 @@ public sealed class PlotSeries
     /// <summary>曲线是否已从控件中删除（删除后写入的数据会被忽略）。</summary>
     public bool IsRemoved { get; internal set; }
 
-    /// <summary>曲线名称（显示在图例中；为空时不出现在图例里）。</summary>
+    /// <summary>曲线名称（显示在图例中；为空时不出现在图例里）。可以在任意线程设置。</summary>
     public string Name
     {
-        get => Plottable?.LegendText ?? _name;
-        set => _owner.RunOnUiThread(() =>
+        get => !HasPendingStyle && Plottable is { } plottable ? plottable.LegendText ?? _name : _name;
+        set
         {
             _name = value ?? string.Empty;
-            ApplyStyle();
-            _owner.RequestRender();
-        });
+            SetStyle(plottable => plottable.LegendText = _name, layoutChanged: false);
+        }
     }
 
-    /// <summary>线条颜色。</summary>
+    /// <summary>线条颜色。可以在任意线程设置。</summary>
     public ScottPlot.Color Color
     {
-        get => Plottable?.Color ?? _color;
-        set => _owner.RunOnUiThread(() =>
+        get => !HasPendingStyle && Plottable is { } plottable ? plottable.Color : _color;
+        set
         {
             _color = value;
-            ApplyStyle();
-            _owner.RequestRender();
-        });
+            SetStyle(plottable => plottable.Color = _color, layoutChanged: false);
+        }
     }
 
-    /// <summary>线宽（默认 1：SkiaSharp 对 1 像素线走快速光栅化，数据密集时明显更快）。</summary>
+    /// <summary>线宽（默认 1：SkiaSharp 对 1 像素线走快速光栅化，数据密集时明显更快）。可以在任意线程设置。</summary>
     public float LineWidth
     {
-        get => Plottable?.LineWidth ?? _lineWidth;
-        set => _owner.RunOnUiThread(() =>
+        get => !HasPendingStyle && Plottable is { } plottable ? plottable.LineWidth : _lineWidth;
+        set
         {
             _lineWidth = value;
-            ApplyStyle();
-            _owner.RequestRender();
-        });
+            SetStyle(plottable => plottable.LineWidth = _lineWidth, layoutChanged: false);
+        }
     }
 
-    /// <summary>是否显示。隐藏的曲线不绘制，也不参与坐标轴的自动计算（X 轴长度与 Y 轴范围）。</summary>
+    /// <summary>
+    /// 是否显示。隐藏的曲线不绘制，也不参与坐标轴的自动计算（X 轴长度与 Y 轴范围）。可以在任意线程设置。
+    /// </summary>
     public bool IsVisible
     {
-        get => Plottable?.IsVisible ?? _isVisible;
-        set => _owner.RunOnUiThread(() =>
+        get => !HasPendingStyle && Plottable is { } plottable ? plottable.IsVisible : _isVisible;
+        set
         {
             _isVisible = value;
-            ApplyStyle();
-            _owner.OnSeriesLayoutChanged();
+            SetStyle(plottable => plottable.IsVisible = _isVisible, layoutChanged: true);
+        }
+    }
+
+    private bool HasPendingStyle => Volatile.Read(ref _pendingStyleChanges) > 0;
+
+    /// <summary>
+    /// 把一项外观修改应用到图元（只改这一项：用户直接通过 <see cref="Signal"/> 改过的其它样式保持不变）。
+    /// UI 线程上立即执行；其它线程上排队到 UI 线程，调用不等待。
+    /// </summary>
+    private void SetStyle(Action<ScottPlot.Plottables.Signal> apply, bool layoutChanged)
+    {
+        Interlocked.Increment(ref _pendingStyleChanges);
+
+        _owner.PostToUiThread(() =>
+        {
+            try
+            {
+                if (Plottable is { } plottable)
+                    apply(plottable);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _pendingStyleChanges);
+            }
+
+            if (layoutChanged)
+                _owner.OnSeriesLayoutChanged();
+            else
+                _owner.RequestRender();
         });
     }
 
@@ -191,12 +226,16 @@ public sealed class PlotSeries
     /// </summary>
     /// <exception cref="InvalidOperationException">
     /// 绝对时间单位下设为 null、而控件又没有 <see cref="ScrollingPlotControl.DefaultStartTime"/> 时抛出（曲线不能没有起始时间）。
-    /// 从其它线程设置时同样抛给调用方。
+    /// 从其它线程设置时在调用线程上检查并抛给调用方；检查通过后排队到 UI 线程生效，调用不等待。
     /// </exception>
     public DateTime? StartTime
     {
         get => EffectiveStartTime;
-        set => _owner.RunOnUiThread(() => _owner.SetSeriesStartTime(this, value));
+        set
+        {
+            _owner.ValidateSeriesStartTime(this, value);
+            _owner.PostToUiThread(() => _owner.SetSeriesStartTime(this, value));
+        }
     }
 
     /// <summary>
@@ -221,7 +260,7 @@ public sealed class PlotSeries
     /// <summary>最新数据点的 Y 值，没有数据时为 <see cref="double.NaN"/>。</summary>
     public double LatestValue => Data.LatestValue;
 
-    /// <summary>被忽略的非有限值数量（NaN / Infinity）。</summary>
+    /// <summary>缺失值数量（NaN、±Infinity、绝对值超过 1e300；占位保存，绘制时在该处断开）。</summary>
     public int SkippedValueCount => Data.SkippedCount;
 
     /// <summary>
@@ -233,6 +272,7 @@ public sealed class PlotSeries
     /// <summary>
     /// 复制一份当前全部数据（快照）。可以在任意线程调用：非 UI 线程会同步切换到 UI 线程复制，
     /// 不会与写入并发而读到扩容中的列表。只包含已经写入曲线的数据（跨线程写入尚在排队、未合并写入的不包含）。
+    /// 非 UI 线程上会等待 UI 线程完成复制：UI 线程正在等待调用线程时（例如关闭窗体时 Join 采集线程）不要从该线程调用，否则两边互相等待。
     /// </summary>
     /// <exception cref="InvalidOperationException">控件句柄创建之前从其它线程调用时抛出（此时无法切换到 UI 线程）。</exception>
     /// <exception cref="ObjectDisposedException">控件已释放或正在释放时从其它线程调用。</exception>
@@ -242,11 +282,11 @@ public sealed class PlotSeries
     public ScottPlot.Plottables.Signal? Signal => Plottable;
 
     /// <summary>添加一个数据点。可以在任意线程调用。</summary>
-    /// <param name="y">Y 值，非有限值会被忽略。</param>
+    /// <param name="y">Y 值；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValue(double y) => _owner.AppendValue(this, y);
 
     /// <summary>批量添加数据点。可以在任意线程调用。</summary>
-    /// <param name="values">Y 值集合，非有限值会被忽略。</param>
+    /// <param name="values">Y 值集合；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValues(IEnumerable<double> values)
     {
         ArgumentNullException.ThrowIfNull(values);
@@ -280,7 +320,7 @@ public sealed class PlotSeries
     /// 批量添加数据点。可以在任意线程调用：UI 线程上直接写入、不复制调用方的数据；
     /// 非 UI 线程上会先复制到待处理列表（调用返回后即可复用传入的缓冲区）。
     /// </summary>
-    /// <param name="values">Y 值，非有限值会被忽略。</param>
+    /// <param name="values">Y 值；缺失值（NaN、±Infinity、绝对值超过 1e300）占一个位置，绘制时在该处断开。</param>
     public void AddValues(ReadOnlySpan<double> values) => _owner.AppendValues(this, values);
 
     /// <summary>清空本曲线的数据（其它曲线不受影响）。可以在任意线程调用。</summary>
@@ -293,11 +333,15 @@ public sealed class PlotSeries
     /// <inheritdoc />
     public override string ToString() => string.IsNullOrEmpty(Name) ? "(默认曲线)" : Name;
 
-    private void SetIntervalSeconds(double seconds) => _owner.RunOnUiThread(() =>
+    /// <summary>
+    /// 设置采样间隔：读取立即返回新值；X 映射与坐标轴在 UI 线程上重算（其它线程上排队，调用不等待）。
+    /// UI 线程上的坐标轴计算只使用缓冲区里已应用的映射（<see cref="PlotDataBuffer.XStep"/>），不会读到一半的状态。
+    /// </summary>
+    private void SetIntervalSeconds(double seconds)
     {
         _intervalSeconds = seconds;
-        _owner.OnSeriesXMappingChanged();
-    });
+        _owner.PostToUiThread(_owner.OnSeriesXMappingChanged);
+    }
 
     /// <summary>
     /// 重新挂接到新 Plot 之前调用：用户可能直接通过 <see cref="Signal"/> 修改过样式，
@@ -305,7 +349,8 @@ public sealed class PlotSeries
     /// </summary>
     internal void CaptureStyle()
     {
-        if (Plottable is null)
+        // 有其它线程设置、还没应用到图元的修改时，本地保存的才是最新值：不能用旧图元上的值覆盖
+        if (Plottable is null || HasPendingStyle)
             return;
 
         _name = Plottable.LegendText ?? string.Empty;

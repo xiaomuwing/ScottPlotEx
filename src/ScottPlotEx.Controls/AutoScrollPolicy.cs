@@ -98,17 +98,19 @@ public static class AutoScrollPolicy
         switch (gesture)
         {
             // 需求 6：左键拖动后，若能看见最新数据则保持模式并把 X 轴最小值设为当前最小值，否则停止滚动。
-            // 需求 7：中键框选放大与左键拖动逻辑相同。
+            // 需求 7：中键框选放大与左键拖动逻辑相同。方向键平移同样按左键拖动处理。
             case PlotViewGesture.LeftDragPan:
             case PlotViewGesture.MiddleDragZoomRectangle:
+            case PlotViewGesture.KeyboardPan:
                 if (!latestDataVisible)
                     return AutoScrollDecision.Stop;
                 return options.KeepScrollingWhenLatestDataVisible
                     ? AutoScrollDecision.KeepAtCurrentXMin
                     : AutoScrollDecision.Stop;
 
-            // 需求 3：放大局部数据（滚轮缩放、右键拖动缩放）后停止滚动。
+            // 需求 3：放大局部数据（滚轮缩放、右键拖动缩放、Ctrl + 方向键缩放）后停止滚动。
             case PlotViewGesture.WheelZoom:
+            case PlotViewGesture.KeyboardZoom:
                 return options.StopScrollingOnWheelZoom
                     ? AutoScrollDecision.Stop
                     : DecideLikeDrag(latestDataVisible, options);
