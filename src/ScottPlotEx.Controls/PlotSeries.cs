@@ -224,8 +224,19 @@ public sealed class PlotSeries
     /// <summary>被忽略的非有限值数量（NaN / Infinity）。</summary>
     public int SkippedValueCount => Data.SkippedCount;
 
-    /// <summary>全部数据的 Y 值（内部实时列表，只应在 UI 线程上读取）。</summary>
+    /// <summary>
+    /// 全部数据的 Y 值：内部数据的实时只读视图（不复制，只应在 UI 线程上读取）。
+    /// 其它线程需要读取时请用 <see cref="GetValuesSnapshot"/>。
+    /// </summary>
     public IReadOnlyList<double> Values => Data.Values;
+
+    /// <summary>
+    /// 复制一份当前全部数据（快照）。可以在任意线程调用：非 UI 线程会同步切换到 UI 线程复制，
+    /// 不会与写入并发而读到扩容中的列表。只包含已经写入曲线的数据（跨线程写入尚在排队、未合并写入的不包含）。
+    /// </summary>
+    /// <exception cref="InvalidOperationException">控件句柄创建之前从其它线程调用时抛出（此时无法切换到 UI 线程）。</exception>
+    /// <exception cref="ObjectDisposedException">控件已释放或正在释放时从其它线程调用。</exception>
+    public double[] GetValuesSnapshot() => _owner.GetValuesSnapshot(this);
 
     /// <summary>用于绘制本曲线的 ScottPlot 图元（可修改更多样式；删除曲线后为 null）。</summary>
     public ScottPlot.Plottables.Signal? Signal => Plottable;
