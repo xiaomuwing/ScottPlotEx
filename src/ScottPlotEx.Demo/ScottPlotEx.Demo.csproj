@@ -1,12 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- 公共设置见仓库根目录的 Directory.Build.props。 -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
     <RootNamespace>ScottPlotEx.Demo</RootNamespace>
     <AssemblyName>ScottPlotEx.Demo</AssemblyName>
   </PropertyGroup>

@@ -1,11 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- 目标框架、WinForms、语言版本等公共设置见仓库根目录的 Directory.Build.props；包版本见 Directory.Packages.props。 -->
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
     <RootNamespace>ScottPlotEx.Controls</RootNamespace>
     <AssemblyName>ScottPlotEx.Controls</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -13,13 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ScottPlot.WinForms" Version="5.1.59" />
+    <PackageReference Include="ScottPlot.WinForms" />
   </ItemGroup>
-
-  <!-- NU1701：ScottPlot.WinForms 会传递引入仅支持 .NET Framework 的 OpenTK 3.1.0（仅 FormsPlotGL 使用，本控件并不使用）。 -->
-  <PropertyGroup>
-    <NoWarn>$(NoWarn);NU1701</NoWarn>
-  </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="ScottPlotEx.Tests" />

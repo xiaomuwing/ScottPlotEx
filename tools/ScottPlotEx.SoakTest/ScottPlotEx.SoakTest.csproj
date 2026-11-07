@@ -1,12 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- 公共设置见仓库根目录的 Directory.Build.props。 -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
     <RootNamespace>ScottPlotEx.SoakTest</RootNamespace>
     <AssemblyName>ScottPlotEx.SoakTest</AssemblyName>
     <IsPackable>false</IsPackable>
@@ -16,10 +12,5 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\ScottPlotEx.Controls\ScottPlotEx.Controls.csproj" />
   </ItemGroup>
-
-  <!-- NU1701：ScottPlot.WinForms 会传递引入仅支持 .NET Framework 的 OpenTK 3.1.0（本工具不使用）。 -->
-  <PropertyGroup>
-    <NoWarn>$(NoWarn);NU1701</NoWarn>
-  </PropertyGroup>
 
 </Project>

@@ -1,0 +1,18 @@
+<Project>
+
+  <!--
+    全部项目共用的设置（控件库、演示程序、测试、压测工具）。目标框架等只在这里改一处。
+    包版本统一在 Directory.Packages.props 中管理。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- NU1701：ScottPlot.WinForms 会传递引入仅支持 .NET Framework 的 OpenTK 3.1.0（仅 FormsPlotGL 使用，本仓库并不使用）。 -->
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
+  </PropertyGroup>
+
+</Project>
