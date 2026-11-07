@@ -164,11 +164,18 @@ internal sealed class PlotCanvas : Control, IPlotControl
             Invalidate();
     }
 
+    /// <summary>
+    /// 绘制与鼠标 / 键盘输入处理之前调用：所属控件在这里完成合并中的坐标轴更新
+    /// （见 <see cref="AxisUpdateMode.Deferred"/>），保证画面与 ScottPlot 的交互处理看到的都是最新范围。
+    /// </summary>
+    internal Action? SyncPendingView { get; set; }
+
     /// <inheritdoc />
     protected override void OnPaint(PaintEventArgs e)
     {
         // 先清标志：绘制过程中再次请求重绘（例如 DataChanged 处理器里继续写数据）仍会触发下一帧
         Interlocked.Exchange(ref _repaintRequested, 0);
+        SyncPendingView?.Invoke();
 
         if (_renderFallback)
         {
@@ -285,26 +292,64 @@ internal sealed class PlotCanvas : Control, IPlotControl
     private bool IsSinglePlot() =>
         Multiplot.Subplots.Count == 1 && ReferenceEquals(Multiplot.Subplots.GetPlot(0), Plot);
 
-    /// <summary>当前坐标轴范围是否与最近一次渲染时记录的范围不同（坐标轴增删也算变化）。</summary>
+    /// <summary>
+    /// 当前坐标轴范围是否与最近一次渲染时记录的范围不同（坐标轴增删也算变化）。
+    /// 每帧调用：X / Y 坐标轴列表按下标遍历，不复制数组、不装箱枚举器。
+    /// </summary>
     private static bool AxisLimitsChangedSinceLastRender(Plot plot)
     {
         Dictionary<IAxis, CoordinateRange>? rendered = plot.RenderManager.LastRender.AxisLimitsByAxis;
-        IAxis[] axes = [.. plot.Axes.GetAxes()];
-
-        if (rendered is null || rendered.Count != axes.Length)
+        if (rendered is null)
             return true;
 
-        foreach (IAxis axis in axes)
+        IEnumerable<IXAxis> xAxes = plot.Axes.GetXAxes();
+        IEnumerable<IYAxis> yAxes = plot.Axes.GetYAxes();
+
+        // 正常情况下二者都是 List：按下标遍历；否则退回通用写法（只多一次分配）
+        if (xAxes is not IReadOnlyList<IXAxis> xList || yAxes is not IReadOnlyList<IYAxis> yList)
+            return ChangedSlow(plot, rendered);
+
+        if (rendered.Count != xList.Count + yList.Count)
+            return true;
+
+        for (int i = 0; i < xList.Count; i++)
+        {
+            if (Changed(rendered, xList[i]))
+                return true;
+        }
+
+        for (int i = 0; i < yList.Count; i++)
+        {
+            if (Changed(rendered, yList[i]))
+                return true;
+        }
+
+        return false;
+
+        static bool ChangedSlow(Plot plot, Dictionary<IAxis, CoordinateRange> rendered)
+        {
+            IAxis[] axes = [.. plot.Axes.GetAxes()];
+
+            if (rendered.Count != axes.Length)
+                return true;
+
+            foreach (IAxis axis in axes)
+            {
+                if (Changed(rendered, axis))
+                    return true;
+            }
+
+            return false;
+        }
+
+        static bool Changed(Dictionary<IAxis, CoordinateRange> rendered, IAxis axis)
         {
             if (!rendered.TryGetValue(axis, out CoordinateRange range))
                 return true;
 
             CoordinateRange now = axis.Range.ToCoordinateRange;
-            if (!SameValue(now.Min, range.Min) || !SameValue(now.Max, range.Max))
-                return true;
+            return !SameValue(now.Min, range.Min) || !SameValue(now.Max, range.Max);
         }
-
-        return false;
 
         static bool SameValue(double a, double b) => a == b || (double.IsNaN(a) && double.IsNaN(b));
     }
@@ -411,6 +456,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <inheritdoc />
     protected override void OnMouseDown(MouseEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UseDpiAwareDragPan();
         UserInputProcessor.ProcessMouseDown(e);
         base.OnMouseDown(e);
@@ -439,6 +485,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <inheritdoc />
     protected override void OnMouseUp(MouseEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UserInputProcessor.ProcessMouseUp(e);
         base.OnMouseUp(e);
     }
@@ -446,6 +493,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <inheritdoc />
     protected override void OnMouseMove(MouseEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UserInputProcessor.ProcessMouseMove(e);
         base.OnMouseMove(e);
     }
@@ -453,6 +501,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <inheritdoc />
     protected override void OnMouseWheel(MouseEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UserInputProcessor.ProcessMouseWheel(e);
         base.OnMouseWheel(e);
     }
@@ -460,6 +509,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <inheritdoc />
     protected override void OnKeyDown(KeyEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UserInputProcessor.ProcessKeyDown(e);
         base.OnKeyDown(e);
     }
@@ -467,6 +517,7 @@ internal sealed class PlotCanvas : Control, IPlotControl
     /// <summary>方向键默认不会进入 KeyDown，FormsPlot 也是在 PreviewKeyDown 里交给 ScottPlot 处理的。</summary>
     protected override void OnPreviewKeyDown(PreviewKeyDownEventArgs e)
     {
+        SyncPendingView?.Invoke();
         UserInputProcessor.ProcessKeyDown(e);
         base.OnPreviewKeyDown(e);
     }

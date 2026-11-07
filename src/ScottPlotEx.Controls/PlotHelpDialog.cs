@@ -56,17 +56,17 @@ internal sealed class PlotHelpDialog : Form
 
         AcceptButton = closeButton;
         CancelButton = closeButton;
+        _textBox = textBox;
     }
 
-    private void InitializeComponent()
-    {
-        SuspendLayout();
-        // 
-        // PlotHelpDialog
-        // 
-        ClientSize = new Size(562, 582);
-        Name = "PlotHelpDialog";
-        ResumeLayout(false);
+    private readonly TextBox _textBox;
 
+    /// <summary>更新正文（帮助窗口已经打开、再次请求帮助时复用同一个窗口）。</summary>
+    public void SetContent(string content)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+
+        if (!string.Equals(_textBox.Text, content, StringComparison.Ordinal))
+            _textBox.Text = content;
     }
 }

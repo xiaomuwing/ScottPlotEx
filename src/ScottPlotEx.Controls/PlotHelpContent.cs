@@ -80,6 +80,9 @@ public static class PlotHelpContent
         · FollowWindowDuration：时间单位下跟随模式固定显示最近这么长时间（0 = 按点数换算或百分比）。
         · XAxisUnit：X 轴单位（Samples 点数 / RelativeTime 相对时间 / AbsoluteTime 绝对时间）。
         · MaxFramesPerSecond：跨线程写入时的重绘帧率上限（0 = 不限）。
+        · AxisUpdateMode：UI 线程逐点写入时坐标轴的更新时机（默认自动：曲线多时合并到本轮消息处理结束后计算一次）；
+          UpdateAxesNow() 立即完成合并中的更新。
+        · AxisOptions：直接修改其中的参数后调用 ApplyAxisOptions() 立即生效。
         · Mode：ScrollingMode.Stacked / Follow / Manual。
         · SetXAxisDisplayPercent(百分比, 模式)：设置 X 轴显示长度百分比（模式必填）
           堆叠 = 显示最新 百分比 的数据（默认 100% 即全部数据，90% 只裁掉最早的 10%）

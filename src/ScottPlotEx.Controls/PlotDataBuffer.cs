@@ -18,11 +18,20 @@ public sealed class PlotDataBuffer
     private double _xStart = 1.0;
     private double _xStep = 1.0;
 
-    /// <summary>创建空缓冲区。</summary>
-    public PlotDataBuffer() => _pyramid = new MinMaxPyramid(_values);
+    private readonly ReadOnlyValueList _view;
 
-    /// <summary>Y 值列表（内部实时列表，直接交给 ScottPlot 绘制）。</summary>
-    public IReadOnlyList<double> Values => _values;
+    /// <summary>创建空缓冲区。</summary>
+    public PlotDataBuffer()
+    {
+        _pyramid = new MinMaxPyramid(_values);
+        _view = new ReadOnlyValueList(_values);
+    }
+
+    /// <summary>
+    /// Y 值列表：内部数据的实时只读视图（不复制；随写入实时变化）。
+    /// 不能转换回可修改的列表——数据只能经由本缓冲区写入，极值金字塔才能保持同步。
+    /// </summary>
+    public IReadOnlyList<double> Values => _view;
 
     /// <summary>内部原始列表（供 <see cref="PyramidSignalSource"/> 直接读取）。</summary>
     internal List<double> RawValues => _values;
@@ -107,6 +116,17 @@ public sealed class PlotDataBuffer
         return true;
     }
 
+    /// <summary>
+    /// 批量添加数据点（数组）。单独提供数组重载：在 C# 12（net8.0 的默认语言版本）下，
+    /// 数组实参同时匹配 <see cref="IEnumerable{T}"/> 与 <see cref="ReadOnlySpan{T}"/> 两个重载会报 CS0121 二义性错误。
+    /// </summary>
+    /// <returns>实际被接受的数据点数量。</returns>
+    public int AddRange(double[] values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        return AddRange(new ReadOnlySpan<double>(values));
+    }
+
     /// <summary>批量添加数据点。</summary>
     /// <returns>实际被接受的数据点数量。</returns>
     public int AddRange(IEnumerable<double> values)
@@ -119,6 +139,10 @@ public sealed class PlotDataBuffer
                 return AddRange(new ReadOnlySpan<double>(array));
             case List<double> list:
                 return AddRange(CollectionsMarshal.AsSpan(list));
+            case ReadOnlyValueList view:
+                // 缓冲区的只读视图（包括自身：buffer.AddRange(buffer.Values)）按 Span 处理：
+                // 扩容前已固定待写入的范围，不会因为边枚举边追加而抛异常
+                return AddRange(CollectionsMarshal.AsSpan(view.Inner));
         }
 
         int added = 0;

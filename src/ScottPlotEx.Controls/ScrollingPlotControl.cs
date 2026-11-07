@@ -95,6 +95,15 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private double _xOffset;
     private bool _applyingLimits;
 
+    // UI 线程逐点写入的坐标轴合并更新（见 AxisUpdateMode）：只在 UI 线程上访问
+    private AxisUpdateMode _axisUpdateMode = AxisUpdateMode.Auto;
+    private bool _autoScrollPending;
+    private bool _autoScrollPosted;
+    private readonly Action _autoScrollPostedAction;
+
+    /// <summary>帮助窗口（同一时刻只打开一个；再次请求帮助时激活它）。</summary>
+    private PlotHelpDialog? _helpDialog;
+
     private MouseButtons _gestureButton = MouseButtons.None;
     private Point _gestureStartPoint;
     private bool _gestureMoved;
@@ -123,8 +132,20 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     // 帧率上限（只限制跨线程写入触发的合并重绘）：两次合并写入之间至少间隔这么多 Stopwatch 刻度，0 表示不限制
     private int _maxFramesPerSecond;
     private long _minFlushIntervalTicks;
-    private long _lastFlushTimestamp;
+
+    /// <summary>
+    /// 帧率上限的时间表：最近一次合并写入对应的“帧时刻”（Stopwatch 时间戳）。下一帧 = 本帧时刻 + 间隔，
+    /// 按固定网格推进，而不是“上一次实际执行时刻 + 间隔”：定时迟到与消息排队的延迟不会累加进周期（不漂移）。
+    /// </summary>
+    private long _frameSlot;
     private HighResolutionTimer? _frameTimer;
+
+    /// <summary>
+    /// 控件不会绘制（最小化 / 不可见 / 渲染关闭）时合并写入按 <see cref="PendingFlushTimeout"/> 节流；
+    /// 这个一次性定时器保证节流期间最后到达的数据也会在超时后写入，不会滞留。
+    /// </summary>
+    private System.Threading.Timer? _hiddenFlushTimer;
+    private long _hiddenFlushMarker;
 
     private Plot? _renderHookedPlot;
 
@@ -162,6 +183,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         _flushPendingAction = FlushPendingValues;
         _attachPendingAction = AttachPendingSeries;
         _runPendingUiActionsAction = RunPendingUiActions;
+        _autoScrollPostedAction = OnAutoScrollPosted;
 
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
         DoubleBuffered = true;
@@ -193,6 +215,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 Name = "ScottPlot",
             };
             Controls.Add(_canvas);
+
+            // 合并更新模式下，绘制与鼠标 / 键盘输入之前先把待更新的坐标轴算好：
+            // 画面与 ScottPlot 的交互处理看到的始终是最新的自动滚动范围
+            _canvas.SyncPendingView = ApplyPendingAutoScroll;
 
             // 中文右键菜单：菜单项与 ScottPlot 自带内容完全一致，并增加“显示帮助”
             _plotMenu = new ChinesePlotMenu(this);
@@ -438,7 +464,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [Description("请求显示帮助时触发。")]
     public event EventHandler<HelpRequestedEventArgs>? ShowHelpRequested;
 
-    /// <summary>数据发生变化（添加或清空）时触发。</summary>
+    /// <summary>
+    /// 数据发生变化（添加或清空）时触发，始终在 UI 线程上。
+    /// 触发频率：UI 线程上每调用一次写入方法触发一次（逐点 <see cref="AddValue"/> 即逐点触发，批量写入每批一次）；
+    /// 跨线程写入每次按帧合并写入触发一次。处理器会被高频调用，请只做轻量工作（例如置标志、由定时器刷新界面）。
+    /// 合并更新坐标轴时（见 <see cref="AxisUpdateMode"/>），处理器中读到的坐标轴范围可能还是写入之前的，需要时先调用 <see cref="UpdateAxesNow"/>。
+    /// </summary>
     [Category("ScottPlotEx")]
     [Description("数据发生变化时触发。")]
     public event EventHandler? DataChanged;
@@ -470,10 +501,38 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public double XOffset => _xOffset;
 
-    /// <summary>自动滚动所使用的取值范围参数。</summary>
+    /// <summary>
+    /// 自动滚动所使用的取值范围参数。直接修改其中的字段后请调用 <see cref="ApplyAxisOptions"/> 使其立即生效
+    /// （否则要等到下一次写入数据、切换模式等操作才会按新参数重算；堆叠原点也不会重新固定）。
+    /// 通过控件属性（<see cref="StackedDisplayPercent"/>、<see cref="FollowWindowPercent"/> 等）修改时会自动生效。
+    /// </summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public ScrollingAxisOptions AxisOptions => _axisOptions;
+
+    /// <summary>
+    /// 使直接修改的 <see cref="AxisOptions"/> 立即生效：校验参数、把百分比等限制在有效范围内、
+    /// 重新固定堆叠原点并按当前模式重算坐标轴（手动模式只校验，不改变视图）。
+    /// </summary>
+    /// <exception cref="ArgumentException">参数无效时抛出（例如空视图的最大值不大于最小值、留白为负，见 <see cref="ScrollingAxisOptions.Validate"/>）。</exception>
+    public void ApplyAxisOptions()
+    {
+        _axisOptions.Validate();
+        _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(_axisOptions.StackedDisplayPercent);
+        _axisOptions.FollowWindowPercent = ScrollingAxisOptions.ClampWindowPercent(_axisOptions.FollowWindowPercent);
+        _axisOptions.FollowWindowPoints = Math.Max(0, _axisOptions.FollowWindowPoints);
+
+        if (_axisOptions.FollowWindowDuration < TimeSpan.Zero)
+            _axisOptions.FollowWindowDuration = TimeSpan.Zero;
+
+        if (IsDisposed || Disposing || _designerFallback)
+            return;
+
+        PinStackedOrigin();
+        ApplyAutoScroll();
+        RememberLimits();
+        RequestRender();
+    }
 
     /// <summary>
     /// 最近一次的自动滚动模式（堆叠或跟随）。停止滚动后中键单击（整体显示）会恢复到该模式。
@@ -728,12 +787,83 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             _maxFramesPerSecond = Math.Max(0, value);
             Interlocked.Exchange(ref _minFlushIntervalTicks, _maxFramesPerSecond > 0 ? Stopwatch.Frequency / _maxFramesPerSecond : 0);
 
+            // 帧率变化：时间表从下一次合并写入重新对齐
+            Interlocked.Exchange(ref _frameSlot, 0);
+
             if (_designerFallback)
                 return;
 
-            if (_maxFramesPerSecond > 0 && _frameTimer is null && !IsDisposed && !DesignMode)
-                _frameTimer = new HighResolutionTimer(OnFrameTimerDue);
+            if (_maxFramesPerSecond > 0)
+            {
+                if (_frameTimer is null && !IsDisposed && !DesignMode)
+                    _frameTimer = new HighResolutionTimer(OnFrameTimerDue);
+
+                return;
+            }
+
+            // 改回不限帧率：释放定时线程。若有一次合并写入正等着定时器到点再发出，改为立即投递，数据不会滞留
+            if (Interlocked.Exchange(ref _frameTimer, null) is { } timer)
+            {
+                timer.Dispose();
+
+                long postedAt = Interlocked.Read(ref _flushPostedAt);
+                if (postedAt != 0
+                    && !_flushAwaitingRender
+                    && Interlocked.CompareExchange(ref _flushPostedAt, 0, postedAt) == postedAt
+                    && HasPendingWrites())
+                {
+                    PostPendingFlush();
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// <see cref="AxisUpdateMode.Auto"/> 模式下改为合并更新的可见曲线数：参与坐标轴计算的可见曲线超过这么多条时，
+    /// UI 线程逐点写入不再逐点重算坐标轴。
+    /// </summary>
+    public const int AutoDeferVisibleSeriesThreshold = 8;
+
+    /// <summary>
+    /// UI 线程逐点写入数据时坐标轴（自动滚动）的更新时机，默认 <see cref="AxisUpdateMode.Auto"/>：
+    /// 可见曲线不超过 <see cref="AutoDeferVisibleSeriesThreshold"/> 条时立即更新，更多时合并到本轮消息处理结束后统一计算一次
+    /// （逐点开销不再随曲线数增长）。跨线程写入按帧合并，不受此设置影响。
+    /// </summary>
+    [Category("ScottPlotEx")]
+    [DefaultValue(AxisUpdateMode.Auto)]
+    [Description("UI 线程逐点写入时坐标轴的更新时机：自动 / 立即 / 合并（曲线很多时合并可显著降低 UI 线程开销）。")]
+    public AxisUpdateMode AxisUpdateMode
+    {
+        get => _axisUpdateMode;
+        set
+        {
+            if (!Enum.IsDefined(value))
+                throw new InvalidEnumArgumentException(nameof(AxisUpdateMode), (int)value, typeof(AxisUpdateMode));
+
+            _axisUpdateMode = value;
+
+            // 切到立即更新：之前合并中的更新马上补上
+            if (value == AxisUpdateMode.Immediate && IsOnUiThread)
+                ApplyPendingAutoScroll();
+        }
+    }
+
+    /// <summary>
+    /// 立即完成合并中的坐标轴更新（见 <see cref="AxisUpdateMode.Deferred"/>）：之后读取 <c>Plot.Axes.GetLimits()</c>
+    /// 得到的就是按当前数据计算的自动滚动范围。没有待更新的内容时什么也不做。
+    /// 绘制、鼠标 / 键盘输入以及控件内部读取坐标轴之前会自动调用，通常不需要手动调用；
+    /// 在写入数据的同一段代码里读取坐标轴范围、或直接用 <c>Plot</c> 导出图像之前调用即可。
+    /// 可以在任意线程调用（非 UI 线程会同步切换到 UI 线程执行）。
+    /// </summary>
+    public void UpdateAxesNow()
+    {
+        if (_designerFallback)
+            return;
+
+        if (IsOnUiThread)
+            ApplyPendingAutoScroll();
+        else
+            RunOnUiThread(ApplyPendingAutoScroll);
     }
 
     /// <summary>是否显示图例（列出名称不为空的曲线）。默认 false。</summary>
@@ -873,10 +1003,32 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int SkippedValueCount => _defaultSeries?.SkippedValueCount ?? 0;
 
-    /// <summary>默认曲线全部数据的 Y 值。</summary>
+    /// <summary>默认曲线全部数据的 Y 值（实时只读视图，只应在 UI 线程上读取；其它线程请用 <see cref="GetValuesSnapshot()"/>）。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public IReadOnlyList<double> Values => _defaultSeries?.Values ?? Array.Empty<double>();
+
+    /// <summary>复制一份默认曲线的全部数据，可以在任意线程调用（见 <see cref="PlotSeries.GetValuesSnapshot"/>）。</summary>
+    public double[] GetValuesSnapshot() => _defaultSeries?.GetValuesSnapshot() ?? [];
+
+    /// <summary>复制曲线数据（UI 线程直接复制；其它线程同步切换到 UI 线程复制）。</summary>
+    internal double[] GetValuesSnapshot(PlotSeries series)
+    {
+        if (IsOnUiThread)
+            return CollectionsMarshal.AsSpan(series.Data.RawValues).ToArray();
+
+        if (!IsHandleCreated)
+            throw new InvalidOperationException("控件句柄创建之前，只能在创建控件的线程上读取数据快照。");
+
+        try
+        {
+            return Invoke(() => CollectionsMarshal.AsSpan(series.Data.RawValues).ToArray());
+        }
+        catch (InvalidOperationException) when (IsDisposed || Disposing || !IsHandleCreated)
+        {
+            throw new ObjectDisposedException(GetType().Name);
+        }
+    }
 
     /// <summary>
     /// 向默认曲线添加一个数据点。X 坐标自动递增（第 1 个点为 1，第 n 个点为 n）。
@@ -948,6 +1100,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
         }
 
+        // 与后台线程清空保持一致：清空之前排队、还没合并写入的数据一并丢弃，不会在清空之后又出现
+        DiscardPendingWrites(only: null);
+
         foreach (PlotSeries series in _series)
         {
             series.Data.Clear();
@@ -957,6 +1112,26 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         RefreshXMapping();
         OnDataCleared();
+    }
+
+    /// <summary>
+    /// 丢弃尚未合并写入的跨线程数据与清空请求（UI 线程上清空 / Reset 时调用）。
+    /// 这些数据是在清空之前写入的，按“写入 → 清空”的顺序应当被清掉，而不是在清空之后再追加到曲线上。
+    /// </summary>
+    /// <param name="only">只处理这条曲线；null 表示全部曲线。</param>
+    private void DiscardPendingWrites(PlotSeries? only)
+    {
+        lock (_pendingLock)
+        {
+            foreach (PlotSeries series in _series)
+            {
+                if (only is not null && !ReferenceEquals(series, only))
+                    continue;
+
+                series.PendingValues.Clear();
+                series.PendingClear = false;
+            }
+        }
     }
 
     #endregion
@@ -1136,7 +1311,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (series.ArrivalStartTime is null)
             CaptureArrivalStartTime(series);
 
-        UpdateView();
+        UpdateView(allowDefer: true);
     }
 
     internal void AppendValues(PlotSeries series, ReadOnlySpan<double> values)
@@ -1165,7 +1340,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (series.ArrivalStartTime is null)
             CaptureArrivalStartTime(series);
 
-        UpdateView();
+        UpdateView(allowDefer: true);
     }
 
     /// <summary>
@@ -1197,6 +1372,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
         }
 
+        DiscardPendingWrites(series);
         series.Data.Clear();
         series.ArrivalStartTime = null;
         series.RejectedValueCount = 0;
@@ -1298,17 +1474,106 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         DataChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void UpdateView()
+    /// <summary>数据写入后更新视图：自动滚动、请求重绘、触发 <see cref="DataChanged"/>。</summary>
+    /// <param name="allowDefer">
+    /// UI 线程逐点写入时为 true：按 <see cref="AxisUpdateMode"/> 可以把坐标轴计算合并到本轮消息处理结束后；
+    /// 跨线程合并写入（本身每帧一次）为 false，立即计算。
+    /// </param>
+    private void UpdateView(bool allowDefer)
     {
         // 鼠标手势（拖动平移 / 框选放大 / 拖动缩放）进行中时不移动坐标轴：
         // 否则每来一个新数据点，自动滚动都会把视图拉回自动窗口（表现为“鼠标一操作就卡一下”），
         // 甚至会把用户的拖动结果覆盖掉。手势结束后由 AutoScrollPolicy 统一决定后续行为。
         if (!IsUserGestureInProgress || !_axisOptions.PauseAutoScrollDuringGesture)
+        {
+            if (allowDefer && ShouldDeferAutoScroll())
+            {
+                DeferAutoScroll();
+            }
+            else
+            {
+                ApplyAutoScroll();
+                RememberLimits();
+            }
+        }
+        else
+        {
+            RememberLimits();
+        }
+
+        RequestRender();
+        DataChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>这次 UI 线程写入是否合并更新坐标轴（见 <see cref="AxisUpdateMode"/>）。</summary>
+    private bool ShouldDeferAutoScroll()
+    {
+        // 合并更新依赖消息循环（投递一条消息在本轮处理结束后计算）：句柄创建之前始终立即更新
+        if (_axisUpdateMode == AxisUpdateMode.Immediate || !IsHandleCreated)
+            return false;
+
+        if (_axisUpdateMode == AxisUpdateMode.Deferred)
+            return true;
+
+        // 自动：只数到阈值 + 1 条即可，开销与曲线总数无关
+        int visible = 0;
+
+        foreach (PlotSeries series in _series)
+        {
+            if (series.Data.Count > 0 && series.IsVisible && ++visible > AutoDeferVisibleSeriesThreshold)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>标记坐标轴待更新；本轮消息处理中第一次标记时投递一条消息，在消息处理结束后统一计算。</summary>
+    private void DeferAutoScroll()
+    {
+        _autoScrollPending = true;
+
+        if (_autoScrollPosted)
+            return;
+
+        _autoScrollPosted = true;
+
+        try
+        {
+            BeginInvoke(_autoScrollPostedAction);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+        {
+            // 句柄正在销毁：直接计算
+            _autoScrollPosted = false;
+            ApplyPendingAutoScroll();
+        }
+    }
+
+    private void OnAutoScrollPosted()
+    {
+        _autoScrollPosted = false;
+        ApplyPendingAutoScroll();
+    }
+
+    /// <summary>
+    /// 完成合并中的坐标轴更新（UI 线程）。投递的消息、绘制与输入之前、以及控件内部读取坐标轴之前都会调用；
+    /// 任何一次完整的自动滚动计算（<see cref="ApplyAutoScroll"/>）都会清除待更新标记。
+    /// </summary>
+    private void ApplyPendingAutoScroll()
+    {
+        if (!_autoScrollPending)
+            return;
+
+        _autoScrollPending = false;
+
+        if (IsDisposed || Disposing || _designerFallback)
+            return;
+
+        // 标记之后开始了鼠标手势：与逐点更新相同，手势期间不移动坐标轴
+        if (!IsUserGestureInProgress || !_axisOptions.PauseAutoScrollDuringGesture)
             ApplyAutoScroll();
 
         RememberLimits();
-        RequestRender();
-        DataChanged?.Invoke(this, EventArgs.Empty);
     }
 
     #endregion
@@ -1659,7 +1924,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (_designerFallback || _canvas is null)
             return;
 
-        // 新建绘图对象并清空全部曲线的数据；曲线本身（名称、颜色等）保留并挂接到新的绘图对象上
+        // 新建绘图对象并清空全部曲线的数据；曲线本身（名称、颜色等）保留并挂接到新的绘图对象上。
+        // Reset 之前排队的跨线程数据同样丢弃（与 ClearData 一致）
+        DiscardPendingWrites(only: null);
+
         foreach (PlotSeries series in _series)
         {
             series.Data.Clear();
@@ -1727,6 +1995,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (_designerFallback || _canvas is null)
             return new Coordinates(double.NaN, double.NaN);
 
+        ApplyPendingAutoScroll();
+
         Plot plot = _canvas.Plot;
         EnsureAxesCurrent(plot);
         return plot.GetCoordinates(pixel, _xAxis!, _yAxis!);
@@ -1747,10 +2017,28 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (args.Handled)
             return;
 
-        // 使用带完整中文说明的 PlotHelpDialog（标题、模式、X 轴单位、鼠标操作、数据接口），
-        // 而不是旧版 ScottPlot.FormHelp（只有鼠标操作提示）；关闭后自动释放。
+        // 已经打开：复用同一个窗口（更新正文并激活），不再叠开多个
+        if (_helpDialog is { IsDisposed: false } existing)
+        {
+            existing.SetContent(args.Content);
+
+            if (existing.WindowState == FormWindowState.Minimized)
+                existing.WindowState = FormWindowState.Normal;
+
+            existing.Activate();
+            return;
+        }
+
+        // 带完整中文说明的帮助窗口（标题、模式、X 轴单位、鼠标操作、数据接口）；关闭后自动释放
         PlotHelpDialog dialog = new(args.Content);
-        dialog.FormClosed += (_, _) => dialog.Dispose();
+        dialog.FormClosed += (_, _) =>
+        {
+            if (ReferenceEquals(_helpDialog, dialog))
+                _helpDialog = null;
+
+            dialog.Dispose();
+        };
+        _helpDialog = dialog;
 
         if (FindForm() is { } owner)
             dialog.Show(owner);
@@ -1868,6 +2156,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     {
         if (_applyingLimits || _designerFallback || _canvas is null)
             return;
+
+        // 完整计算一次即满足了合并中的更新
+        _autoScrollPending = false;
 
         Plot? plot = _canvas.Plot;
         if (plot is null || plot.Axes is null)
@@ -2231,6 +2522,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (_designerFallback || _canvas is null)
             return null;
 
+        // 合并更新模式：先完成待更新的坐标轴，手势判断与回滚基准都以最新的自动滚动范围为准
+        ApplyPendingAutoScroll();
+
         Plot? plot = _canvas.Plot;
         if (plot is null)
             return null;
@@ -2279,15 +2573,14 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (Interlocked.CompareExchange(ref _flushPostedAt, now, postedAt) != postedAt)
             return; // 其它线程抢先投递了
 
-        if (interval > 0 && _frameTimer is { } timer)
+        if (interval > 0 && Volatile.Read(ref _frameTimer) is { } timer)
         {
-            long due = Interlocked.Read(ref _lastFlushTimestamp) + interval;
+            // 下一帧时刻 = 本帧时刻 + 间隔（固定网格，见 _frameSlot）
+            long due = Interlocked.Read(ref _frameSlot) + interval;
 
-            if (due > now)
-            {
-                timer.Schedule(due);
+            // 定时器在并发中被释放（帧率上限改回 0 / 控件释放）时调度不会生效：直接投递，不能让数据滞留
+            if (due > now && timer.Schedule(due))
                 return;
-            }
         }
 
         BeginInvokeFlush();
@@ -2319,7 +2612,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             return;
 
         PendingFlushCount++;
-        Interlocked.Exchange(ref _lastFlushTimestamp, Stopwatch.GetTimestamp());
+        AdvanceFrameSlot();
 
         bool renderExpected = IsRenderExpected();
 
@@ -2330,8 +2623,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
         else
         {
-            // 不会有渲染完成通知：先复位再交换，交换之后到达的数据一定会触发下一次投递，不会滞留
-            Interlocked.Exchange(ref _flushPostedAt, 0);
+            // 不会有渲染完成通知（最小化 / 不可见 / 渲染关闭）：按 PendingFlushTimeout 节流。
+            // 投递标记保留为当前时刻，采集线程在超时之前不会再投递（否则每批数据一到就执行一次合并写入、重算一次坐标轴）；
+            // 一次性定时器在超时后补投，保证交换之后到达的数据不会滞留
+            long marker = Stopwatch.GetTimestamp();
+            Interlocked.Exchange(ref _flushPostedAt, marker);
+            ScheduleHiddenFlush(marker);
         }
 
         // 锁内只交换各曲线的待处理列表，写入在锁外进行，采集线程几乎不会被阻塞
@@ -2373,8 +2670,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
             if (batch.Count > 0)
             {
+                int batchCount = batch.Count;
                 int accepted = series.Data.AddRange(CollectionsMarshal.AsSpan(batch));
                 batch.Clear();
+                TrimPendingBuffer(batch, batchCount);
                 added += accepted;
 
                 // 清空后的第一批数据：记录到达时刻（起始时间由它决定时需要重算 X 映射，循环结束后统一重算一次）
@@ -2392,16 +2691,73 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (cleared)
             OnDataCleared();
 
+        // 合并写入本身就是按帧一次：立即更新坐标轴
         if (added > 0)
-            UpdateView();
+            UpdateView(allowDefer: false);
 
         // 已请求重绘时等这一帧画完（OnPlotRenderFinished）再允许下一次投递：
-        // 两次合并写入之间消息队列是空的，WM_PAINT / WM_TIMER 一定能插进来，写入频率自动跟随帧率
+        // 两次合并写入之间 WM_PAINT 一定能插进来，写入频率自动跟随帧率。
+        // 注意：不限帧率（MaxFramesPerSecond = 0）且数据持续到达时，“合并写入 → 绘制 → 下一次合并写入”首尾相接，
+        // 优先级最低的 WM_TIMER 可能长时间得不到处理（窗体上的 WinForms 定时器停摆）；设置帧率上限即可留出空闲
         if (renderExpected && !cleared && added == 0)
         {
             _flushAwaitingRender = false;
             CompletePendingFlush();
         }
+    }
+
+    /// <summary>
+    /// 待处理列表收缩阈值：UI 线程卡顿一次造成的突发积压会让列表扩容到很大，之后每帧只有少量数据时把多余容量还回去
+    /// （待处理 / 取走两个列表轮换使用，两者都会在各自取走数据后收缩）。
+    /// </summary>
+    private const int PendingTrimCapacity = 64 * 1024;
+
+    private static void TrimPendingBuffer(List<double> buffer, int lastBatchCount)
+    {
+        if (buffer.Capacity > PendingTrimCapacity && lastBatchCount * 4 < buffer.Capacity)
+            buffer.Capacity = Math.Max(lastBatchCount * 2, 1024);
+    }
+
+    /// <summary>
+    /// 合并写入执行时推进帧率上限的时间表（UI 线程）：本帧时刻 = 上一帧时刻 + 间隔；
+    /// 落后超过一帧（空闲后的第一帧、UI 线程卡顿）时以当前时刻重新对齐，不补帧。
+    /// </summary>
+    private void AdvanceFrameSlot()
+    {
+        long interval = Interlocked.Read(ref _minFlushIntervalTicks);
+        if (interval <= 0)
+            return;
+
+        long now = Stopwatch.GetTimestamp();
+        long slot = Interlocked.Read(ref _frameSlot) + interval;
+
+        if (slot <= now - interval || slot > now + interval)
+            slot = now;
+
+        Interlocked.Exchange(ref _frameSlot, slot);
+    }
+
+    /// <summary>不会绘制时，在节流超时后补投一次合并写入（见 <see cref="FlushPendingValues"/>）。</summary>
+    private void ScheduleHiddenFlush(long marker)
+    {
+        if (IsDisposed || Disposing)
+            return;
+
+        Interlocked.Exchange(ref _hiddenFlushMarker, marker);
+        _hiddenFlushTimer ??= new System.Threading.Timer(OnHiddenFlushDue);
+        _hiddenFlushTimer.Change(PendingFlushTimeout, Timeout.InfiniteTimeSpan);
+    }
+
+    /// <summary>线程池线程：节流超时。期间没有其它投递（标记未变）且仍有待处理数据时补投。</summary>
+    private void OnHiddenFlushDue(object? state)
+    {
+        long marker = Interlocked.Read(ref _hiddenFlushMarker);
+
+        if (marker == 0 || IsDisposed)
+            return;
+
+        if (Interlocked.CompareExchange(ref _flushPostedAt, 0, marker) == marker && HasPendingWrites())
+            PostPendingFlush();
     }
 
     private void OnPlotRenderFinished(object? sender, RenderDetails e)
@@ -2453,11 +2809,6 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         return canvas.Plot.RenderManager.EnableRendering;
     }
 
-    private void InitializeComponent()
-    {
-
-    }
-
     /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
@@ -2473,8 +2824,16 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
             UnhookRenderFinished();
 
-            _frameTimer?.Dispose();
-            _frameTimer = null;
+            Interlocked.Exchange(ref _frameTimer, null)?.Dispose();
+
+            _hiddenFlushTimer?.Dispose();
+            _hiddenFlushTimer = null;
+            Interlocked.Exchange(ref _hiddenFlushMarker, 0);
+
+            if (_helpDialog is { IsDisposed: false } helpDialog)
+                helpDialog.Close();
+
+            _helpDialog = null;
 
             lock (_pendingLock)
             {

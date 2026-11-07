@@ -37,6 +37,12 @@ public sealed class ChinesePlotMenu : IPlotMenu
     private readonly ScrollingPlotControl _control;
     private bool _showModeItems = true;
 
+    /// <summary>
+    /// 模式菜单项的动作委托 → 对应的模式。按委托实例而不是按显示文字识别模式项：
+    /// 同名的自定义菜单项不会被误当成模式项，模式项改名后也仍能正确勾选。
+    /// </summary>
+    private readonly Dictionary<Action<Plot>, ScrollingMode> _modeActions = [];
+
     internal ChinesePlotMenu(ScrollingPlotControl control)
     {
         _control = control ?? throw new ArgumentNullException(nameof(control));
@@ -113,10 +119,15 @@ public sealed class ChinesePlotMenu : IPlotMenu
             return;
         }
 
+        if (!TryGetImageSize(plot, out int width, out int height))
+        {
+            MessageBox.Show("曲线区域尺寸为 0，无法保存图像。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
         try
         {
-            PixelSize size = plot.RenderManager.LastRender.FigureRect.Size;
-            plot.Save(dialog.FileName, (int)size.Width, (int)size.Height, format);
+            plot.Save(dialog.FileName, width, height, format);
         }
         catch (Exception)
         {
@@ -124,15 +135,39 @@ public sealed class ChinesePlotMenu : IPlotMenu
         }
     }
 
-    /// <summary>“复制到剪贴板”：按最近一次渲染的尺寸生成位图并放入剪贴板。</summary>
+    /// <summary>“复制到剪贴板”：按最近一次渲染的尺寸生成位图并放入剪贴板（还没渲染过时按画布尺寸）。</summary>
     public void CopyImageToClipboard(Plot plot)
     {
         ArgumentNullException.ThrowIfNull(plot);
 
-        PixelSize size = plot.RenderManager.LastRender.FigureRect.Size;
-        using ScottPlot.Image image = plot.GetImage((int)size.Width, (int)size.Height);
+        if (!TryGetImageSize(plot, out int width, out int height))
+            return;
+
+        using ScottPlot.Image image = plot.GetImage(width, height);
         using Bitmap bitmap = image.GetBitmap();
         Clipboard.SetImage(bitmap);
+    }
+
+    /// <summary>
+    /// 导出图像的尺寸：最近一次渲染的尺寸；还没渲染过（尺寸为 0）时退回画布当前的客户区尺寸。
+    /// 导出前先完成合并中的坐标轴更新，图像与屏幕上的范围一致。
+    /// </summary>
+    private bool TryGetImageSize(Plot plot, out int width, out int height)
+    {
+        _control.UpdateAxesNow();
+
+        PixelSize size = plot.RenderManager.LastRender.FigureRect.Size;
+        width = (int)size.Width;
+        height = (int)size.Height;
+
+        if (width <= 0 || height <= 0)
+        {
+            System.Drawing.Size client = _control.Canvas?.ClientSize ?? System.Drawing.Size.Empty;
+            width = client.Width;
+            height = client.Height;
+        }
+
+        return width > 0 && height > 0;
     }
 
     /// <summary>“自动缩放”：缩放到全部数据，再同步滚动状态（复位 X 轴偏移，必要时恢复 / 切换滚动模式）。</summary>
@@ -140,9 +175,13 @@ public sealed class ChinesePlotMenu : IPlotMenu
     {
         ArgumentNullException.ThrowIfNull(plot);
 
+        // 先完成合并中的坐标轴更新，避免它在自动缩放之后才执行、覆盖自动缩放的结果
+        _control.UpdateAxesNow();
         plot.Axes.AutoScale();
-        _control.Refresh();
+
+        // 先同步滚动状态、再合并重绘一次：不必在中间同步画一帧（切换模式时紧接着又要重绘）
         _control.HandleAutoscaleRequested();
+        _control.RequestRender();
     }
 
     /// <summary>“在新窗口中打开”：在模态窗口中交互式查看同一个 Plot，关闭后归还给本控件。</summary>
@@ -150,7 +189,8 @@ public sealed class ChinesePlotMenu : IPlotMenu
     {
         ArgumentNullException.ThrowIfNull(plot);
 
-        FormsPlotViewer.Launch(plot, "Interactive Plot");
+        _control.UpdateAxesNow();
+        FormsPlotViewer.Launch(plot, "交互式查看");
         _control.Refresh();
     }
 
@@ -164,15 +204,19 @@ public sealed class ChinesePlotMenu : IPlotMenu
         ContextMenuItems.Clear();
         ContextMenuItems.AddRange(StandardContextMenuItems());
         ContextMenuItems.Add(new ContextMenuItem { IsSeparator = true });
+        _modeActions.Clear();
 
         if (_showModeItems)
         {
             foreach ((string label, ScrollingMode mode) in ModeItems)
             {
+                Action<Plot> action = _ => _control.Mode = mode;
+                _modeActions[action] = mode;
+
                 ContextMenuItems.Add(new ContextMenuItem
                 {
                     Label = label,
-                    OnInvoke = _ => _control.Mode = mode,
+                    OnInvoke = action,
                 });
             }
 
@@ -214,8 +258,9 @@ public sealed class ChinesePlotMenu : IPlotMenu
                 continue;
             }
 
-            // 滚动模式渲染为勾选项：勾选状态完全由控件的当前模式推导
-            if (TryGetMode(item.Label, out ScrollingMode mode))
+            // 滚动模式渲染为勾选项：勾选状态完全由控件的当前模式推导。
+            // 按动作委托识别（见 _modeActions），同名的自定义项不受影响，模式项改名后仍然有效
+            if (item.OnInvoke is { } invoke && _modeActions.TryGetValue(invoke, out ScrollingMode mode))
             {
                 menu.Items.Add(CreateModeMenuItem(item, mode, plot));
                 continue;
@@ -240,12 +285,15 @@ public sealed class ChinesePlotMenu : IPlotMenu
 
         foreach (ToolStripItem item in menu.Items)
         {
-            if (item is ToolStripMenuItem menuItem && TryGetMode(menuItem.Text ?? string.Empty, out ScrollingMode mode))
+            if (item is ToolStripMenuItem { Tag: ScrollingMode mode } menuItem)
                 menuItem.Checked = _control.Mode == mode;
         }
     }
 
-    /// <summary>菜单项文字对应的滚动模式。</summary>
+    /// <summary>
+    /// 默认模式菜单项的文字对应的滚动模式（只认默认文字）。
+    /// 菜单本身按菜单项的动作识别模式项，不依赖文字；该方法保留给按文字查找默认菜单项的调用方。
+    /// </summary>
     public static bool TryGetMode(string label, out ScrollingMode mode)
     {
         foreach ((string itemLabel, ScrollingMode itemMode) in ModeItems)
@@ -268,6 +316,7 @@ public sealed class ChinesePlotMenu : IPlotMenu
             // 只在打开菜单时按当前模式勾选；点击不会自行切换勾选状态（避免勾选与模式不一致）
             Checked = _control.Mode == mode,
             CheckOnClick = false,
+            Tag = mode,
         };
 
         Action<Plot> action = item.OnInvoke;

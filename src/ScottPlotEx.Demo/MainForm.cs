@@ -23,10 +23,10 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _displayPercent = new()
     {
         Minimum = 0,
-        Maximum = 100,
+        Maximum = 240,
         DecimalPlaces = 1,
         Increment = 5,
-        Value = 30,
+        Value = 240,
         Width = 72,
         Margin = new Padding(3, 3, 3, 3),
     };

@@ -119,11 +119,44 @@ public sealed class ScrollingAxisOptions
     /// <summary>复制一份参数。</summary>
     public ScrollingAxisOptions Clone() => (ScrollingAxisOptions)MemberwiseClone();
 
+    /// <summary>
+    /// 校验参数：数值必须是有限值；留白比例、留白点数、容差不能为负；数据水平时的最小半宽必须为正；
+    /// 空视图的最大值必须大于最小值。百分比越界不算错误（使用时自动限制在有效范围内）。
+    /// </summary>
+    /// <exception cref="ArgumentException">参数无效时抛出，消息中给出参数名。</exception>
+    public void Validate()
+    {
+        RequireNonNegative(StackedRightPaddingFraction, nameof(StackedRightPaddingFraction));
+        RequireNonNegative(StackedRightMarginPoints, nameof(StackedRightMarginPoints));
+        RequireNonNegative(FollowRightPaddingFraction, nameof(FollowRightPaddingFraction));
+        RequireNonNegative(FollowRightMarginPoints, nameof(FollowRightMarginPoints));
+        RequireNonNegative(YPaddingFraction, nameof(YPaddingFraction));
+        RequireNonNegative(LatestVisibilityToleranceFraction, nameof(LatestVisibilityToleranceFraction));
+
+        if (!double.IsFinite(FlatDataHalfSpan) || FlatDataHalfSpan <= 0)
+            throw new ArgumentException($"{nameof(FlatDataHalfSpan)} 必须是正的有限值（当前 {FlatDataHalfSpan}）。", nameof(FlatDataHalfSpan));
+
+        RequireRange(EmptyXMin, EmptyXMax, nameof(EmptyXMin), nameof(EmptyXMax));
+        RequireRange(EmptyYMin, EmptyYMax, nameof(EmptyYMin), nameof(EmptyYMax));
+
+        static void RequireNonNegative(double value, string name)
+        {
+            if (!double.IsFinite(value) || value < 0)
+                throw new ArgumentException($"{name} 必须是非负的有限值（当前 {value}）。", name);
+        }
+
+        static void RequireRange(double min, double max, string minName, string maxName)
+        {
+            if (!double.IsFinite(min) || !double.IsFinite(max) || max <= min)
+                throw new ArgumentException($"{maxName} 必须大于 {minName}，且两者都是有限值（当前 {minName} = {min}、{maxName} = {max}）。", maxName);
+        }
+    }
+
     /// <summary>把堆叠模式显示长度百分比限制在 1 ~ 100（非有限值按默认 100 处理）。</summary>
     public static double ClampDisplayPercent(double percent) =>
         double.IsFinite(percent) ? Math.Clamp(percent, 1.0, 100.0) : DefaultStackedDisplayPercent;
 
     /// <summary>把跟随模式窗口百分比限制在 0.1 ~ 100（非有限值按默认 30 处理）。</summary>
     public static double ClampWindowPercent(double percent) =>
-        double.IsFinite(percent) ? Math.Clamp(percent, 0.1, 100.0) : 30.0;
+        double.IsFinite(percent) ? Math.Clamp(percent, 0.1, 100.0) : DefaultFollowWindowPercent;
 }

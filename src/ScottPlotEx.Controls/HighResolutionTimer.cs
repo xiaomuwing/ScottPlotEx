@@ -55,53 +55,72 @@ internal sealed class HighResolutionTimer : IDisposable
     /// <summary>是否使用了高精度可等待定时器（旧系统上为 false，精度退回系统时钟中断间隔）。</summary>
     public bool IsHighResolution { get; }
 
-    /// <summary>在指定时刻触发一次回调（覆盖之前尚未触发的定时）。</summary>
+    /// <summary>在指定时刻触发一次回调（覆盖之前尚未触发的定时）。可以在任意线程调用，与 <see cref="Dispose"/> 并发也安全。</summary>
     /// <param name="dueTimestamp">截止时间（<see cref="Stopwatch.GetTimestamp"/>）；已经过去时会尽快触发。</param>
-    public void Schedule(long dueTimestamp)
+    /// <returns>定时器已释放（调度没有生效）时返回 false，调用方需要自行处理这一次触发。</returns>
+    public bool Schedule(long dueTimestamp)
     {
         if (_disposed)
-            return;
+            return false;
 
         Volatile.Write(ref _due, Math.Max(dueTimestamp, 1));
-        _wake.Set();
+
+        try
+        {
+            _wake.Set();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 与 Dispose 并发：事件已经释放，这次调度不会触发
+            return false;
+        }
+
+        return !_disposed;
     }
 
     private void Run()
     {
         WaitHandle[] handles = [_wake, _timer];
 
-        while (!_disposed)
+        try
         {
-            long due = Volatile.Read(ref _due);
-
-            if (due == 0)
+            while (!_disposed)
             {
-                _wake.WaitOne();
-                continue;
+                long due = Volatile.Read(ref _due);
+
+                if (due == 0)
+                {
+                    _wake.WaitOne();
+                    continue;
+                }
+
+                long remaining = due - Stopwatch.GetTimestamp();
+
+                if (remaining <= 0)
+                {
+                    // 只有抢到这一次截止时间的线程才触发：期间被重新调度则按新的截止时间等待
+                    if (Interlocked.CompareExchange(ref _due, 0, due) == due)
+                        InvokeCallback();
+
+                    continue;
+                }
+
+                // 负值表示相对时间，单位 100 ns
+                long relative = -Math.Max(1, (long)(remaining * 10_000_000.0 / Stopwatch.Frequency));
+
+                if (!SetWaitableTimer(_timer.SafeWaitHandle, ref relative, 0, IntPtr.Zero, IntPtr.Zero, false))
+                {
+                    // 设置失败（极少见）：退回按毫秒等待，保证不会忙等
+                    _wake.WaitOne(Math.Max(1, (int)(remaining * 1000 / Stopwatch.Frequency)));
+                    continue;
+                }
+
+                WaitHandle.WaitAny(handles);
             }
-
-            long remaining = due - Stopwatch.GetTimestamp();
-
-            if (remaining <= 0)
-            {
-                // 只有抢到这一次截止时间的线程才触发：期间被重新调度则按新的截止时间等待
-                if (Interlocked.CompareExchange(ref _due, 0, due) == due)
-                    InvokeCallback();
-
-                continue;
-            }
-
-            // 负值表示相对时间，单位 100 ns
-            long relative = -Math.Max(1, (long)(remaining * 10_000_000.0 / Stopwatch.Frequency));
-
-            if (!SetWaitableTimer(_timer.SafeWaitHandle, ref relative, 0, IntPtr.Zero, IntPtr.Zero, false))
-            {
-                // 设置失败（极少见）：退回按毫秒等待，保证不会忙等
-                _wake.WaitOne(Math.Max(1, (int)(remaining * 1000 / Stopwatch.Frequency)));
-                continue;
-            }
-
-            WaitHandle.WaitAny(handles);
+        }
+        catch (ObjectDisposedException) when (_disposed)
+        {
+            // 释放时等待线程退出超时、句柄已被回收：线程直接结束，不能让未处理异常终止进程
         }
     }
 
@@ -125,7 +144,12 @@ internal sealed class HighResolutionTimer : IDisposable
 
         _disposed = true;
         _wake.Set();
-        _thread.Join(1000);
+
+        // 只有确认等待线程已经退出才释放句柄：线程还在 WaitAny / SetWaitableTimer 中时释放会让它在已释放的句柄上抛异常。
+        // 超时（回调长时间不返回）时把句柄留给终结器回收，线程醒来后看到 _disposed 自行退出。
+        if (!_thread.Join(1000))
+            return;
+
         CancelWaitableTimer(_timer.SafeWaitHandle);
         _timer.Dispose();
         _wake.Dispose();

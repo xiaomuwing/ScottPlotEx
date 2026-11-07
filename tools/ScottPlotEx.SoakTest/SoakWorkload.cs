@@ -943,7 +943,8 @@ internal sealed class SoakWorkload
         Application.DoEvents();
         Thread.Sleep(30);
 
-        foreach (Form form in Application.OpenForms.OfType<FormHelp>().ToArray())
+        // 内置帮助窗口（PlotHelpDialog 是内部类型）：按标题识别
+        foreach (Form form in Application.OpenForms.Cast<Form>().Where(f => f.Text == PlotHelpContent.Title).ToArray())
         {
             _stats.CountHelpWindow();
             form.Close();
