@@ -12,10 +12,10 @@
 ```
 ScottPlotEx.sln
 ├─ src/ScottPlotEx.Controls   用户控件库（核心交付物）
-├─ src/ScottPlotEx.Demo       演示程序：每秒添加 1 个数据点、可切换模式；另有“多曲线测试”“10 曲线流式演示”“堆叠堆积压测”窗口
-├─ tests/ScottPlotEx.Tests    自动化测试（276 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
+├─ src/ScottPlotEx.Demo       演示程序：自动添加数据（每 20 ms 1 点）、可切换模式；另有“多曲线测试”“10 曲线流式演示”“堆叠堆积压测”窗口
+├─ tests/ScottPlotEx.Tests    自动化测试（304 个用例，含真实窗体与真实窗口消息的鼠标操作验证、多曲线、X 轴单位；另有性能基准与闪烁量化）
 ├─ artifacts/                 测试生成的示例图片
-├─ docs/                      真实演示程序运行截图
+├─ docs/                      审查记录；演示程序截图由测试生成到这里（不提交到仓库，见“测试”一节）
 ├─ LICENSE                    本项目许可（MIT）
 └─ THIRD-PARTY-NOTICES.md     第三方软件的许可与版权声明
 ```
@@ -24,7 +24,7 @@ ScottPlotEx.sln
 
 ```powershell
 dotnet build ScottPlotEx.sln          # 生成解决方案
-dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（276 个）
+dotnet test  ScottPlotEx.sln --filter "Category!=Performance"   # 运行全部功能测试（304 个）
 dotnet test  ScottPlotEx.sln -c Release --filter "Category=Performance"   # 只跑性能基准（必须 Release）
 dotnet run --project src\ScottPlotEx.Demo   # 运行演示程序
 dotnet run --project src\ScottPlotEx.Demo -- --multiseries   # 直接打开“多曲线测试”窗口（--preset 0/1/2 选择预设场景，--unit 0/1/2 选择 X 轴单位；--unit 2 绝对时间会自动把起始时间设为当前时间）
@@ -133,7 +133,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | 补充 5 | 两种模式都要能设置 X 轴显示长度（百分比接口） | `SetXAxisDisplayPercent(percent, mode)`（写入必须指定模式）+ 只读的 `CurrentXAxisDisplayPercent`/`GetXAxisDisplayPercent(mode)` + `ShowAllData()`；底层为 `StackedDisplayPercent`（默认 100 = 全部数据）与 `FollowWindowPercent`（默认 30，尾部窗口）。**方向一致：数值越大看得越多**，越界自动限制，改动后立即重算坐标轴且不切换模式 | `XAxisDisplayPercentTests`、`ReproFollowToStackedTests.StackedMode_DisplayPercent90_StillLooksStacked`、`ScrollingAxisCalculatorTests.StackedMode_DisplayPercent*` / `FollowMode_WindowPercent*` |
 | 补充 6 | 调整百分比后必须能改回堆叠模式 | **重新选择模式即恢复该模式默认视图**：选择“堆叠模式”把显示百分比复位为 100%（`X: [0, 点数+2]`），选择“跟随模式”把窗口复位为 30%；中键整体显示同样把堆叠百分比恢复为 100%；数据更新、拖动不会复位。可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 改为“百分比跨模式保持” | `ReproFollowToStackedTests.AfterChangingStackedPercent_ReselectingStackedShowsAllData` / `AfterChangingFollowPercent_ReselectingFollowRestoresDefaultWindow` / `DisplayPercent_CanPersistAcrossModeChanges`、`docs/demo-08-stacked-after-percent.png` |
 | 补充 7 | X 轴单位对标 imc：点数 / 相对时间 / 绝对时间；每条曲线可以有自己的采样间隔；跟随窗口同样支持三种单位；时间单位下平滑滚动；绝对时间必须设置起始时间 | `XAxisUnit`、`PlotSeries.SampleInterval / SampleRate / StartTime`、`DefaultSampleInterval / DefaultStartTime`、`FollowWindowDuration`；所有按 X 计算的地方按曲线做“下标 ↔ X”换算（`SeriesXExtent`、`PlotDataBuffer.XStart / XStep`、数据源 `Period / XOffset`）；`TimeAxisTickGenerator` 生成时间刻度 | `XAxisUnitTests`、`XAxisUnitDemoTests`、`artifacts/x-axis-*.png` |
-| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 276 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
+| 8 | 完整验证，特别是各类鼠标操作，不能闪退 | 304 个自动化测试（含真实窗体+消息循环+Skia 绘制+真实 Windows 鼠标消息）＋真实演示程序消息级操作验证 | `dotnet test`，见下文“验证结果” |
 
 ## 控件 API
 
@@ -144,7 +144,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `Mode`（`ScrollingMode`） | `Stacked`（默认）/ `Follow` / `Manual`。重新赋值即复位偏移并立即恢复滚动 |
 | `AddValue(double y)` | 向**默认曲线**追加一个数据点，X 自动递增（点数单位第 n 个点 X = n；时间单位见 `XAxisUnit`）。**可在任意线程调用** |
 | `AddValues(IEnumerable<double>)` / `AddValues(params double[])` / `AddValues(ReadOnlySpan<double>)` | 向默认曲线批量追加 |
-| `ClearData()` | 清空**全部曲线**的数据（曲线本身保留）并回到空视图 |
+| `ClearData()` | 清空**全部曲线**的数据（曲线本身保留）并回到空视图：同时复位拖动偏移、解除 Y 锁定、堆叠显示百分比恢复为 100% |
 | `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 默认曲线的数据查询。缺失值（NaN、±Infinity、绝对值超过 1e300）**占一个位置**（之后的点 X 不错位），绘制时在该处断开，计入 `SkippedValueCount`；`DataCount` 包含缺失点，`LatestValue` 可能是 NaN。`Values` 是内部数据的实时**只读视图**（不复制，只应在 UI 线程上读取，不能转换回 `List` 修改） |
 | `GetValuesSnapshot()` | 复制一份默认曲线的全部数据，**可在任意线程调用**（非 UI 线程同步切换到 UI 线程复制；UI 线程正在等待调用线程时不要调用，否则互相等待） |
 | `AddSeries(name, color?, startTime?)` → `PlotSeries` | 添加一条曲线（不指定颜色时按调色板取色；`startTime` 等同于创建后设置 `PlotSeries.StartTime`）。可在任意线程调用：非 UI 线程上立即返回曲线，挂接排队到 UI 线程，**不等待 UI 线程**（UI 线程正在等待采集线程时也不会互相卡死）。绝对时间单位下既没有 `startTime` 也没有 `DefaultStartTime` 时抛出 `InvalidOperationException` |
@@ -163,8 +163,8 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `LastAutoScrollMode` | 最近一次的自动滚动模式（堆叠或跟随），中键单击整体显示后恢复到该模式 |
 | `SetXAxisDisplayPercent(percent, mode)` | 设置**指定模式**的 X 轴显示长度百分比（模式必填），立即生效；堆叠=按当前点数把原点**固定**在该百分比处（100=原点 0 显示全部），跟随=显示最后 `百分比` 的滑动窗口 |
 | `CurrentXAxisDisplayPercent` / `GetXAxisDisplayPercent(mode)` | 读取当前模式 / 指定模式的百分比（只读，安全） |
-| `StackedDisplayPercent` / `FollowWindowPercent` | 直接读写两种模式的百分比（默认 `100` / `30`），越界值自动限制在有效范围（堆叠 1 ~ 1000，跟随 0.1 ~ 100） |
-| `IsYAxisLocked` / `ResetYAxis()` | 自动滚动期间用户在 Y 方向调整过视图（左键拖动的竖直移动达到 5 像素、中键框选、方向键 ↑↓）后 Y 被锁定：X 继续滚动，Y 保持用户的范围。整体显示、重新选择模式、`ClearData()`、`Reset()`、`ResetYAxis()` 时解除 |
+| `StackedDisplayPercent` / `FollowWindowPercent` | 直接读写两种模式的百分比（默认 `100` / `30`），越界值自动限制在有效范围（堆叠 1 ~ 1000，跟随 0.1 ~ 100）。堆叠小于 100 表示“在设置的这一刻裁掉最早的数据”，**没有可见数据时设置小于 100 的值不生效**（保持 100） |
+| `IsYAxisLocked` / `ResetYAxis()` | 自动滚动期间用户在 Y 方向调整过视图（左键拖动的竖直移动达到 5 像素、中键框选、方向键 ↑↓）后 Y 被锁定：X 继续滚动，Y 保持用户的范围。整体显示、重新选择模式、`ClearData()`、`Reset()`、`ResetYAxis()`、清空曲线后已没有可见数据时解除 |
 | `ShowAllData()` | 恢复显示全部数据（把堆叠模式显示百分比设为 `100`） |
 | `AxisOptions`（`ScrollingAxisOptions`） | 留白比例、窗口百分比、各类策略开关等可调参数。直接修改其中的字段后调用 `ApplyAxisOptions()` 立即生效 |
 | `ApplyAxisOptions()` | 校验 `AxisOptions`（无效参数抛出 `ArgumentException`）、把百分比限制在有效范围、重新固定堆叠原点并重算坐标轴 |
@@ -192,7 +192,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 | `DataCount` / `LatestX` / `LatestValue` / `Values` / `SkippedValueCount` | 本曲线的数据查询（缺失值占位、计入 `SkippedValueCount`，见默认曲线的说明；`LatestX` 按当前单位：点数单位等于点数，时间单位为距 `TimeReference` 的秒数；`Values` 为只读视图，只应在 UI 线程上读取） |
 | `GetValuesSnapshot()` | 复制一份本曲线的全部数据，**可在任意线程调用**（非 UI 线程会等待 UI 线程完成复制） |
 | `GetX(index)` | 第 `index` 个数据点（下标从 0 开始）在当前单位下的 X 坐标 |
-| `Signal` | 本曲线的 ScottPlot 图元（可修改更多样式；`Reset()` 后挂到新绘图对象上时，直接改过的样式会保留） |
+| `Signal` | 本曲线的 ScottPlot 图元（可修改更多样式；`Reset()` 后挂到新绘图对象上时，直接改过的样式会保留）。`Signal.Data.YScale` / `YOffset` 参与自动 Y 轴计算（下一次写入时生效，或调用 `ApplyAxisOptions()` 立即重算） |
 
 ### ScottPlot.WinForms 接口（全部实现 / 转发）
 
@@ -290,11 +290,12 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 - Y 轴：取各可见曲线**在当前 X 窗口内**极值的并集——每条曲线把 X 窗口按自己的“下标 ↔ X”映射换算成下标区间再查极值金字塔（开销与窗口长度无关）；
   整条落在窗口之外的曲线（较短，或时间上更早结束）不参与。
 - 隐藏的曲线（`IsVisible = false`）不绘制，也不参与 X / Y 的自动计算；显示 / 隐藏、删除曲线后立即按剩余可见曲线重算坐标轴。
-- `ClearData()` 清空全部曲线的数据；`PlotSeries.Clear()` 只清空一条，其它曲线的数据与用户的拖动结果保留。
+- `ClearData()` 清空全部曲线的数据；`PlotSeries.Clear()` 只清空一条，其它可见曲线仍有数据时，它们的数据、用户的拖动结果、Y 锁定与堆叠百分比都保留；
+  清空后已没有可见数据时视为重新开始（与 `ClearData()` 相同）。从其它线程“清空后马上写入”与在 UI 线程上的结果相同。
 
 范围限制：堆叠 `1% ~ 1000%`，跟随 `0.1% ~ 100%` 且窗口至少 2 个数据点宽（保证最新数据点始终可见）。
 
-**堆叠百分比超过 100%：右侧预留空白，分阶段扩展。** 设置时把右端固定为“（点数 + 2）× 百分比”，曲线只占左侧一部分（240% 时约 42%），坐标轴在数据写满之前保持不动；数据写到右端（右侧留白不足 2 个点）时再按同一比例扩展一次。例如 100 个点时设 240% → `X: [0, 244.8]`，写到第 243 个点时扩展为 `X: [0, 588]`。这样每秒来一个点时坐标轴不会每秒整体缩放一次。时间单位同理。中键整体显示、重新选择堆叠模式都会把它恢复为 100%。
+**堆叠百分比超过 100%：右侧预留空白，分阶段扩展。** 设置时把右端固定为“（点数 + 2）× 百分比”，曲线只占左侧一部分（240% 时约 42%），坐标轴在数据写满之前保持不动；数据写到右端（右侧留白不足 2 个点）时再按同一比例扩展一次。例如 100 个点时设 240% → `X: [0, 244.8]`，写到第 243 个点时扩展为 `X: [0, 588]`。这样每秒来一个点时坐标轴不会每秒整体缩放一次。时间单位同理。中键整体显示、重新选择堆叠模式、清空数据都会把它恢复为 100%。
 改动百分比会立即生效（堆叠=重新固定原点），**但不会切换模式**；重新选择模式会把该模式的百分比复位为默认值
 （可用 `AxisOptions.ResetDisplayPercentOnModeChange = false` 关闭），`ShowAllData()` 等价于把堆叠显示百分比设为 100%。
 
@@ -357,7 +358,8 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 **Y 轴范围**：`[最小值 − 5% × 跨度, 最大值 + 5% × 跨度]`；跨度为 0（数据完全水平）时使用 `max(|值| × 5%, 0.5)`，
 避免 Y 轴退化成一条线。堆叠模式统计**全部数据**，跟随模式统计**当前显示的数据**；缺失值不参与统计。
 用户在 Y 方向调整过视图（左键拖动的竖直移动达到 5 像素、中键框选、方向键 ↑↓）且继续滚动时，**Y 锁定**为用户的范围（X 继续滚动），
-整体显示、重新选择模式、清空数据、`ResetYAxis()` 时恢复自动。
+整体显示、重新选择模式、清空数据（清空后已没有可见数据）、`ResetYAxis()` 时恢复自动。
+曲线设置了 ScottPlot 原生的 `Signal.Data.YScale` / `YOffset` 时，按换算后的值（Y × YScale + YOffset）统计。
 
 **缺失值**：NaN、±Infinity、绝对值超过 1e300 的值占一个位置（之后的点 X 不错位，多条曲线按序号 / 时间的对齐保持不变），
 绘制时在缺失处断开（缺失段短于一个像素列时不断开，避免高密度数据被切碎）；Y 轴自动范围、数据游标都跳过缺失值。
@@ -423,7 +425,7 @@ DateTime time = plot.TimeReference!.Value.AddSeconds(x);  // 任意 X 对应的�
 
 ```powershell
 dotnet test ScottPlotEx.sln
-# 已通过! - 失败: 0，通过: 276，已跳过: 0，总计: 276（不含 Category=Performance）
+# 已通过! - 失败: 0，通过: 304，已跳过: 0，总计: 304（不含 Category=Performance）
 ```
 
 测试分两类：
@@ -453,20 +455,26 @@ dotnet test ScottPlotEx.sln
    - `RealMessageInputTests` 另外通过 `PostMessage` 把**真实的 Windows 鼠标消息**发到画布窗口，验证窗口过程（WndProc）路径下的左键拖动、右键菜单与“中键单击整体显示后恢复原模式”同样成立。
     - 压力测试：150 轮随机鼠标操作 + 持续添加数据；5000 个数据点；200 次模式切换；窗体尺寸变化；控件释放后再调用数据接口。
    - 渲染验证：用生成的 `artifacts/stacked-mode.png`、`artifacts/follow-mode.png`、`artifacts/context-menu.png` 人工核对两种模式与右键菜单的显示效果。
-   - `DemoScreenshotTests` 在测试进程内驱动真实演示窗体（`MainForm`），按顺序验证“跟随模式 → 中键整体显示 → 堆叠模式 → 停止滚动 → 中键整体显示恢复”，并生成 `docs/demo-06`、`docs/demo-07`、`docs/demo-05` 三张文档截图。
+   - `DemoScreenshotTests` 在测试进程内驱动真实演示窗体（`MainForm`），按顺序验证“跟随模式 → 中键整体显示 → 堆叠模式 → 停止滚动 → 中键整体显示恢复”，并生成 `docs/demo-06`、`docs/demo-07`、`docs/demo-05` 等文档截图。
 
-此外还运行了真实演示程序，并通过系统消息驱动窗口完成了拖动、滚轮、右键菜单等操作（截图见 `docs/`）：
+此外还运行了真实演示程序，并通过系统消息驱动窗口完成了拖动、滚轮、右键菜单等操作。
+下表中的截图**不提交到仓库**，运行下面的命令生成到 `docs/`（`demo-04` 由 `ArtifactRenderTests` 生成，其余由 `DemoScreenshotTests` 生成）：
+
+```powershell
+dotnet test ScottPlotEx.sln -c Release --filter "FullyQualifiedName~DemoScreenshotTests|FullyQualifiedName~ArtifactRenderTests"
+```
+
 
 | 截图 | 内容 |
 |------|------|
-| `docs/demo-01-stacked.png` | 每秒添加数据，堆叠模式：`X` 为 `0 ~ 点数+2`（例如 43 个点 → `X: [0.0, 45.0]`），Y 轴为数据最大/最小值各向外 5% |
+| `docs/demo-01-stacked.png` | 自动添加数据，堆叠模式：`X` 为 `0 ~ 点数+2`（例如 43 个点 → `X: [0.0, 45.0]`），Y 轴为数据最大/最小值各向外 5% |
 | `docs/demo-02-after-drag.png` | 向右拖动后看不到最新数据 → 自动切到“手动（停止滚动）”，继续添加数据视图保持不变 |
 | `docs/demo-03-after-wheel.png` | 滚轮缩放后仍保持停止滚动 |
 | `docs/demo-04-context-menu.png` | 中文右键菜单：保存图像 / 复制到剪贴板 / 自动缩放 / 在新窗口中打开 / **勾选项：堆叠模式（已勾选）/ 跟随模式 / 手动模式（停止滚动）** / 显示帮助（由控件自身的菜单构建代码渲染，测试自动生成） |
 | `docs/demo-05-middle-click-resume.png` | 停止滚动后中键单击整体显示 → 退出停止状态并继续滚动 |
 | `docs/demo-06-follow-mode.png` | 跟随模式：`X` 为最新 30% 数据、最大值为 `点数 + 2`（例如 43 个点 → `X: [32.1, 45.0]`） |
 | `docs/demo-07-follow-to-stacked.png` | 跟随模式下按中键整体显示 → 自动换成堆叠模式，`X: [0.0, 点数+2]` |
-| `docs/demo-08-stacked-after-percent.png` | 把跟随窗口调成 50% 后再选择“堆叠模式” → 回到完整视图：`点数：170`，`X: [0.0, 172.0]`，百分比自动复位为 `0.0` |
+| `docs/demo-08-stacked-after-percent.png` | 把跟随窗口调成 50% 后再选择“堆叠模式” → 回到完整视图：`点数：170`，`X: [0.0, 172.0]`，堆叠显示百分比复位为 `100` |
 | `docs/demo-09-stacked-90-percent.png` | 堆叠模式把“堆叠显示 %”设为 **90** → 显示约 90% 的数据（`点数：190`，`X: [19.2, 192.0]`），模式仍是堆叠、不会退化成跟随样子 |
 
 ## 性能基准：最大每秒数据更新数量

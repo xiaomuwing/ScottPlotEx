@@ -14,6 +14,7 @@ namespace ScottPlotEx.Controls;
 /// 行为与内置数据源保持一致（渲染结果逐像素相同，自动缩放范围、最近点查询结果相同）：
 /// <c>GetY</c> / <c>GetYs</c> / <c>GetLimitsY(int, int)</c> 返回未缩放的原始值，YScale / YOffset 由基类统一施加；
 /// <c>GetYs(int, int)</c> 会把下标裁剪到现有数据范围内。
+/// 唯一的差别：<c>GetLimitsY</c> 在区间内没有有效数据时返回 NaN（内置数据源为 ±∞，会让自动缩放得到 Y = [−∞, +∞]）。
 /// </para>
 /// <para>
 /// “下标 ↔ X”换算全部交给基类的 <see cref="SignalSourceBase.Period"/> / <see cref="SignalSourceBase.XOffset"/>（GetX / GetIndex），
@@ -62,8 +63,14 @@ internal sealed class PyramidSignalSource : SignalSourceBase, ISignalSource, IDa
     /// <inheritdoc />
     public override SignalRangeY GetLimitsY(int firstIndex, int lastIndex)
     {
-        // 空区间时 min = +∞、max = −∞，与内置数据源一致
         _pyramid.Query(firstIndex, lastIndex + 1, out double min, out double max);
+
+        // 区间内没有有效数据（空曲线 / 全是缺失值）时金字塔返回 min = +∞、max = −∞。
+        // ScottPlot 合并各图元的范围时会跳过 NaN，却会把 ±∞ 当作真实值，
+        // 结果整个 Plot 的自动缩放变成 Y = [−∞, +∞]（右键菜单“自动缩放”时有一条空曲线即可复现）：改为返回“没有范围”
+        if (!(min <= max))
+            return new SignalRangeY(double.NaN, double.NaN);
+
         return new SignalRangeY(min, max);
     }
 

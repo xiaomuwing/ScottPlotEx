@@ -368,7 +368,7 @@ public class MultiSeriesTests
         host.AssertNoUnhandledExceptions();
     }
 
-    [Fact(DisplayName = "多曲线：非 UI 线程可以创建曲线并修改样式（同步切换到 UI 线程）")]
+    [Fact(DisplayName = "多曲线：非 UI 线程可以创建曲线并修改样式（排队到 UI 线程执行，调用不等待）")]
     public void AddSeriesAndStyle_FromBackgroundThread()
     {
         using WinFormsTestHost host = WinFormsTestHost.Start(() => new ScrollingPlotControl());

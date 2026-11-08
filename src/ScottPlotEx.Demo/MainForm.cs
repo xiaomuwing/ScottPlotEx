@@ -6,19 +6,22 @@ using ScottPlotEx.Controls;
 namespace ScottPlotEx.Demo;
 
 /// <summary>
-/// 演示窗体：每秒向 <see cref="ScrollingPlotControl"/> 添加一个数据点，
+/// 演示窗体：定时向 <see cref="ScrollingPlotControl"/> 添加数据点（每 20 ms 一个，即每秒 50 点，便于很快看出效果），
 /// 并可通过单选框切换堆叠 / 跟随 / 手动模式。
 /// </summary>
 public sealed class MainForm : Form
 {
     private readonly ScrollingPlotControl _plot = new() { Dock = DockStyle.Fill };
-    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 20 };
+    /// <summary>自动添加数据的间隔：20 ms（每秒 50 点）。需求 1 的“每秒添加数据”场景把间隔改为 1000 即可，行为相同、只是更慢。</summary>
+    private const int AutoAddIntervalMilliseconds = 20;
+
+    private readonly System.Windows.Forms.Timer _timer = new() { Interval = AutoAddIntervalMilliseconds };
     private readonly Random _random = new(20260920);
 
     private readonly RadioButton _stackedMode = new() { Text = "堆叠模式", AutoSize = true, Checked = true };
     private readonly RadioButton _followMode = new() { Text = "跟随模式", AutoSize = true };
     private readonly RadioButton _manualMode = new() { Text = "手动（停止滚动）", AutoSize = true };
-    private readonly CheckBox _autoAdd = new() { Text = "每秒添加数据", AutoSize = true, Checked = true };
+    private readonly CheckBox _autoAdd = new() { Text = "自动添加数据", AutoSize = true, Checked = true };
     private readonly Label _displayPercentLabel = new() { Text = "X 轴显示 %", AutoSize = true, Padding = new Padding(12, 6, 0, 0) };
     private readonly NumericUpDown _displayPercent = new()
     {
@@ -49,7 +52,7 @@ public sealed class MainForm : Form
         Controls.Add(_plot);
         Controls.Add(CreateToolbar());
 
-        _plot.Plot.Title("实时数据（每秒 1 点）");
+        _plot.Plot.Title($"实时数据（每 {AutoAddIntervalMilliseconds} ms 1 点）");
         _plot.Plot.XLabel("数据点序号");
         _plot.Plot.YLabel("数值");
         _plot.ModeChanged += (_, _) => UpdateModeUi();

@@ -36,7 +36,20 @@ public class PyramidSignalSourceTests
         (byte[] pyramidImage, AxisLimits pyramidLimits, string pyramidNearest) = Render(plot => plot.Add.Signal(new PyramidSignalSource(buffer)), values);
 
         Assert.True(builtInImage.AsSpan().SequenceEqual(pyramidImage), $"{count} 点时渲染结果与内置数据源不一致。");
-        Assert.Equal(builtInLimits.ToString(), pyramidLimits.ToString());
+
+        if (count == 0)
+        {
+            // 唯一的有意差别：没有有效数据时内置数据源的 Y 为 (+∞, −∞)，会让整个 Plot 的自动缩放变成 Y = [−∞, +∞]；
+            // 金字塔数据源返回 NaN（ScottPlot 合并各图元范围时跳过 NaN）。X 仍须一致
+            Assert.Equal((builtInLimits.Left, builtInLimits.Right), (pyramidLimits.Left, pyramidLimits.Right));
+            Assert.True(double.IsPositiveInfinity(builtInLimits.Bottom) && double.IsNegativeInfinity(builtInLimits.Top), $"内置数据源的空范围变了：{builtInLimits}");
+            Assert.True(double.IsNaN(pyramidLimits.Bottom) && double.IsNaN(pyramidLimits.Top), $"空数据源应返回 NaN：{pyramidLimits}");
+        }
+        else
+        {
+            Assert.Equal(builtInLimits.ToString(), pyramidLimits.ToString());
+        }
+
         Assert.Equal(builtInNearest, pyramidNearest);
     }
 

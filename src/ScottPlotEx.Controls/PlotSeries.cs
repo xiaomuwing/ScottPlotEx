@@ -278,7 +278,12 @@ public sealed class PlotSeries
     /// <exception cref="ObjectDisposedException">控件已释放或正在释放时从其它线程调用。</exception>
     public double[] GetValuesSnapshot() => _owner.GetValuesSnapshot(this);
 
-    /// <summary>用于绘制本曲线的 ScottPlot 图元（可修改更多样式；删除曲线后为 null）。</summary>
+    /// <summary>
+    /// 用于绘制本曲线的 ScottPlot 图元（可修改更多样式；删除曲线后为 null）。
+    /// <c>Signal.Data.YScale</c> / <c>YOffset</c>（显示值 = Y × YScale + YOffset）同样参与自动 Y 轴计算：
+    /// 修改后在下一次写入数据时生效，没有新数据时可调用 <see cref="ScrollingPlotControl.ApplyAxisOptions"/> 立即重算。
+    /// X 方向的 <c>Period</c> / <c>XOffset</c> 由控件按 X 轴单位管理，不要修改。
+    /// </summary>
     public ScottPlot.Plottables.Signal? Signal => Plottable;
 
     /// <summary>添加一个数据点。可以在任意线程调用。</summary>

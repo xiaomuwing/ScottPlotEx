@@ -64,8 +64,12 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     private readonly Action _attachPendingAction;
     private readonly Action _runPendingUiActionsAction;
 
-    /// <summary>全部曲线（含默认曲线，默认曲线始终在第一位）。只在 UI 线程上修改，修改时持有待处理锁。</summary>
-    private readonly List<PlotSeries> _series = [];
+    /// <summary>
+    /// 全部曲线（含默认曲线，默认曲线始终在第一位）。写时复制：增删曲线时在待处理锁内换成一个新数组，
+    /// 已有的数组永远不再修改。因此任何线程都可以不加锁遍历（拿到的是那一刻的快照）——
+    /// 其它线程上 <see cref="AddSeries"/> 时，UI 线程正在进行的遍历不会抛出“集合已修改”。
+    /// </summary>
+    private volatile PlotSeries[] _series = [];
     private readonly PlotSeries _defaultSeries;
     private int _seriesCreated;
     private bool _showLegend;
@@ -237,7 +241,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         {
             // 默认曲线：单曲线接口（AddValue / AddValues / Values / DataCount ……）读写的就是它；名称为空，不出现在图例中
             _defaultSeries = new PlotSeries(this, string.Empty, Colors.Blue, isDefault: true);
-            _series.Add(_defaultSeries);
+            _series = [_defaultSeries];
             _seriesCreated = 1;
 
             // 自绘画布：SkiaSharp 直接渲染进 GDI DIB，WM_PAINT 中一次 BitBlt 到窗口。
@@ -295,7 +299,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         catch (Exception exception) when (DesignerSupport.IsNativeLibraryFailure(exception) || DesignerSupport.IsDesignTime)
         {
             // 设计器 / 缺少 SkiaSharp 原生库：清掉半初始化状态，显示占位控件，保证拖放不会报错。
-            _series.Clear();
+            _series = [];
             _seriesCreated = 0;
 
             if (_canvas is not null)
@@ -578,7 +582,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     {
         ThrowIfNotUiThread();
         _axisOptions.Validate();
-        _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(_axisOptions.StackedDisplayPercent);
+        _axisOptions.StackedDisplayPercent = NormalizeStackedDisplayPercent(_axisOptions.StackedDisplayPercent);
         _axisOptions.FollowWindowPercent = ScrollingAxisOptions.ClampWindowPercent(_axisOptions.FollowWindowPercent);
         _axisOptions.FollowWindowPoints = Math.Max(0, _axisOptions.FollowWindowPoints);
 
@@ -643,7 +647,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         }
         else
         {
-            _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(percent);
+            _axisOptions.StackedDisplayPercent = NormalizeStackedDisplayPercent(percent);
 
             // 关键：在此刻把原点固定下来（换算一次），之后数据刷新不再移动它
             PinStackedOrigin();
@@ -661,6 +665,8 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>
     /// 堆叠模式的 X 轴显示长度百分比（1 ~ 1000）。默认 100，即从 0 开始显示全部数据；
     /// 数值越大看到的数据越多（90 只裁掉最早的 10%）；大于 100 时在右侧预留空白、分阶段扩展（见 <see cref="ScrollingAxisOptions.StackedDisplayPercent"/>）。
+    /// 小于 100 时在设置的这一刻按当时的点数固定原点，因此<b>没有可见数据时设置小于 100 的值不生效</b>（保持 100）；
+    /// 清空数据后（没有可见数据时）恢复为 100。
     /// </summary>
     [Category("ScottPlotEx")]
     [DefaultValue(100.0)]
@@ -671,10 +677,26 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         set
         {
             ThrowIfNotUiThread();
-            _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.ClampDisplayPercent(value);
+            _axisOptions.StackedDisplayPercent = NormalizeStackedDisplayPercent(value);
             PinStackedOrigin();
             ReapplyAxes();
         }
+    }
+
+    /// <summary>
+    /// 规范化要设置的堆叠显示百分比：限制在 1 ~ 1000；没有可见数据时小于 100 的值不生效（保持 100）。
+    /// 小于 100 表示“在设置的这一刻按当时的点数裁掉最早的数据”，没有数据时无从裁剪；
+    /// 若照样记下来，读出的值与画面（显示全部数据）不一致，之后显示 / 隐藏曲线时还会突然按它裁剪。
+    /// 大于 100 不受影响（右端在第一批数据到达时固定，见 <see cref="ExtendStackedRightLimit"/>）。设计器中保持原值。
+    /// </summary>
+    private double NormalizeStackedDisplayPercent(double percent)
+    {
+        double clamped = ScrollingAxisOptions.ClampDisplayPercent(percent);
+
+        if (_designerFallback || clamped >= ScrollingAxisOptions.DefaultStackedDisplayPercent || !VisibleExtents().IsEmpty)
+            return clamped;
+
+        return ScrollingAxisOptions.DefaultStackedDisplayPercent;
     }
 
     /// <summary>
@@ -1270,19 +1292,13 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>全部曲线（含默认曲线，默认曲线在第一位）。返回调用时刻的快照，可以在任意线程读取。</summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public IReadOnlyList<PlotSeries> Series
-    {
-        get
-        {
-            lock (_pendingLock)
-                return [.. _series];
-        }
-    }
+    public IReadOnlyList<PlotSeries> Series => [.. _series];
 
     /// <summary>
     /// 添加一条曲线（对应 imc 曲线窗口中的一个通道）。各曲线的数据彼此独立：点数单位下 X 坐标都从 1 开始，
     /// 时间单位下按各自的起始时间与采样间隔换算；坐标轴按所有可见曲线自动计算。
-    /// 可以在任意线程调用（非 UI 线程会同步切换到 UI 线程执行）。
+    /// 可以在任意线程调用：非 UI 线程上立即创建并返回曲线（之后写入的数据照常排队），
+    /// 挂接到 Plot 排队到 UI 线程执行，调用不等待 UI 线程。
     /// </summary>
     /// <param name="name">曲线名称（显示在图例中，见 <see cref="ShowLegend"/>）。</param>
     /// <param name="color">线条颜色；不指定时按调色板依次取色。</param>
@@ -1353,7 +1369,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             {
                 OwnStartTime = startTime,
             };
-            _series.Add(series);
+
+            // 写时复制：换成新数组，正在遍历旧数组的线程（UI 线程的坐标轴计算 / 合并写入）不受影响
+            _series = [.. _series, series];
         }
 
         return series;
@@ -1562,7 +1580,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
             lock (_pendingLock)
             {
-                _series.Remove(series);
+                _series = Array.FindAll(_series, item => !ReferenceEquals(item, series)); // 写时复制
                 series.IsRemoved = true;
                 series.PendingValues.Clear();
                 series.PendingClear = false;
@@ -1633,9 +1651,16 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     /// <summary>数据被清空（全部或某一条曲线）：重新固定堆叠原点并恢复自动视图。</summary>
     private void OnDataCleared()
     {
-        // 全部可见数据都没了才复位 X 轴偏移；只清空其中一条曲线时保留用户的拖动结果
+        // 全部可见数据都没了 = 重新开始：复位 X 轴偏移、解除 Y 锁定（之后写入的数据量级可能完全不同，
+        // 沿用旧的 Y 范围会让新曲线整条落在视图之外）、堆叠显示百分比恢复为 100%
+        // （小于 100 表示“按设置时的点数裁掉最早的数据”，没有数据时无从裁剪；与重新选择堆叠模式一致）。
+        // 只清空其中一条曲线、其它可见曲线仍有数据时，保留用户的拖动结果、Y 调整与百分比
         if (VisibleExtents().IsEmpty)
+        {
             _xOffset = 0;
+            _yLocked = false;
+            _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.DefaultStackedDisplayPercent;
+        }
 
         PinStackedOrigin(); // 数据清空后按剩余数据重新固定原点（全部清空时归零，重新开始时从 0 堆叠）
         ApplyAutoScroll();
@@ -2013,7 +2038,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public ChinesePlotMenu PlotMenu => _plotMenu;
 
-    /// <summary>默认曲线的 ScottPlot 图元（可自行修改颜色、线宽等样式；其它曲线见 <see cref="PlotSeries.Signal"/>）。</summary>
+    /// <summary>
+    /// 默认曲线的 ScottPlot 图元（可自行修改颜色、线宽等样式；<c>Data.YScale</c> / <c>YOffset</c> 参与自动 Y 轴计算，
+    /// 说明见 <see cref="PlotSeries.Signal"/>）。
+    /// </summary>
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public ScottPlot.Plottables.Signal? Signal => _defaultSeries?.Plottable;
@@ -2124,6 +2152,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         _xOffset = 0;
         _yLocked = false;
+        _axisOptions.StackedDisplayPercent = ScrollingAxisOptions.DefaultStackedDisplayPercent; // 与 ClearData 一致
         _canvas.Reset();
         _canvas.Plot.DataBackground.Color = Colors.White;
         ApplyDefaultFont();
@@ -2472,7 +2501,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
                 : data.TryGetValueRange(xMin, xMax, out seriesMin, out seriesMax);
 
             if (found)
-                Include(seriesMin, seriesMax);
+                Include(series, seriesMin, seriesMax);
         }
 
         // 可见窗口里没有任何曲线的数据（例如拖到了数据之外）：退回各可见曲线的全部数据范围
@@ -2481,7 +2510,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             foreach (PlotSeries series in _series)
             {
                 if (series.IsVisible && series.Data.TryGetValueRange(out double seriesMin, out double seriesMax))
-                    Include(seriesMin, seriesMax);
+                    Include(series, seriesMin, seriesMax);
             }
         }
 
@@ -2494,8 +2523,20 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         return ScrollingAxisCalculator.TryCalculateYWindow(dataMin, dataMax, _axisOptions, out yMin, out yMax);
 
-        void Include(double min, double max)
+        void Include(PlotSeries series, double min, double max)
         {
+            // 曲线设置了 ScottPlot 原生的 Signal.Data.YScale / YOffset 时画出来的是换算后的值（Y × YScale + YOffset），
+            // 坐标轴也按换算后的值统计；YScale 为负时上下界互换
+            if (series.Plottable?.Data is { } source && (source.YScale != 1.0 || source.YOffset != 0.0))
+            {
+                double a = (min * source.YScale) + source.YOffset;
+                double b = (max * source.YScale) + source.YOffset;
+                (min, max) = a <= b ? (a, b) : (b, a);
+
+                if (!double.IsFinite(min) || !double.IsFinite(max))
+                    return; // 换算后溢出：这条曲线不参与坐标轴计算
+            }
+
             if (min < dataMin)
                 dataMin = min;
             if (max > dataMax)
@@ -2832,7 +2873,10 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
     internal void HandleAutoscaleRequested()
     {
         AxisLimits? fallback = _lastKnownLimits;
-        AxisLimits? limits = ReadLimits();
+
+        // ScottPlot 的自动缩放可能得到非法范围（例如用户自己添加的图元返回了 ±∞）：照常按整体显示重算，不能直接返回，
+        // 否则视图停留在非法范围。整体显示被关闭时由 RestoreLimitsIfInvalid 回退到操作前的视图
+        AxisLimits? limits = ReadLimits(requireReal: false);
         if (limits is null)
             return;
 
@@ -2849,7 +2893,9 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         _contextMenus.Add(menu);
     }
 
-    private AxisLimits? ReadLimits()
+    /// <summary>读取当前坐标轴范围（先完成合并中的坐标轴更新）。</summary>
+    /// <param name="requireReal">为 true 时范围不是实数（含 ±∞ / NaN）返回 null；为 false 时原样返回。</param>
+    private AxisLimits? ReadLimits(bool requireReal = true)
     {
         if (_designerFallback || _canvas is null)
             return null;
@@ -2863,7 +2909,7 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         EnsureAxesCurrent(plot);
         AxisLimits limits = plot.Axes.GetLimits(_xAxis!, _yAxis!);
-        return limits.IsReal ? limits : null;
+        return limits.IsReal || !requireReal ? limits : null;
     }
 
     private void RememberLimits() => _lastKnownLimits = ReadLimits();
@@ -2994,12 +3040,16 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
             ScheduleHiddenFlush(marker);
         }
 
-        // 锁内只交换各曲线的待处理列表，写入在锁外进行，采集线程几乎不会被阻塞
+        // 锁内只交换各曲线的待处理列表，写入在锁外进行，采集线程几乎不会被阻塞。
+        // 两段处理都用锁内取到的同一份曲线快照：其间其它线程新建的曲线没有被交换过，留到下一次合并写入
         bool clearAll;
+        PlotSeries[] seriesList;
 
         lock (_pendingLock)
         {
-            foreach (PlotSeries series in _series)
+            seriesList = _series;
+
+            foreach (PlotSeries series in seriesList)
             {
                 series.DrainClear = series.PendingClear;
                 series.PendingClear = false;
@@ -3014,23 +3064,35 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
         if (clearAll)
             _yLocked = false;
 
+        // 第一段：先执行全部清空请求，并按“清空完成、新数据还没到”的状态处理（复位 X 偏移、解除 Y 锁定、重新固定堆叠原点）。
+        // 与 UI 线程上先 Clear 再 AddValues 的结果一致；若清空与之后的数据一起追加后再处理，
+        // “已经没有数据”的判断会被新数据掩盖，旧的拖动偏移 / Y 锁定就会套用到新数据上
         bool cleared = false;
+
+        foreach (PlotSeries series in seriesList)
+        {
+            if (!series.DrainClear)
+                continue;
+
+            series.DrainClear = false;
+            series.Data.Clear();
+            series.ArrivalStartTime = null;
+            series.RejectedValueCount = 0;
+            cleared = true;
+        }
+
+        if (cleared)
+        {
+            RefreshXMapping();
+            OnDataCleared();
+        }
+
+        // 第二段：追加数据（清空之前排队的数据在清空请求时已丢弃，这里都是清空之后到达的）
         bool mappingChanged = false;
         int added = 0;
 
-        foreach (PlotSeries series in _series)
+        foreach (PlotSeries series in seriesList)
         {
-            // 同一曲线先清空、再追加清空之后到达的数据（清空之前排队的数据在清空请求时已丢弃）
-            if (series.DrainClear)
-            {
-                series.DrainClear = false;
-                series.Data.Clear();
-                series.ArrivalStartTime = null;
-                series.RejectedValueCount = 0;
-                cleared = true;
-                mappingChanged = true;
-            }
-
             List<double> batch = series.DrainingValues;
 
             // 绝对时间单位下没有起始时间的曲线（只可能是没人设置起始时间的默认曲线）拒收：在 UI 线程上判断，采集线程不会收到异常
@@ -3059,9 +3121,6 @@ public partial class ScrollingPlotControl : UserControl, IPlotControl
 
         if (mappingChanged)
             RefreshXMapping();
-
-        if (cleared)
-            OnDataCleared();
 
         // 合并写入本身就是按帧一次：立即更新坐标轴
         if (added > 0)
